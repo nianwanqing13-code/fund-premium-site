@@ -1,0 +1,340 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>场内基金溢价率排行</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: "Microsoft YaHei", "微软雅黑", Arial, sans-serif;
+      background: #f4f6f9;
+      color: #333;
+      padding: 20px;
+    }
+    .container { max-width: 1100px; margin: 0 auto; }
+    header {
+      background: linear-gradient(135deg, #c62828, #e53935);
+      color: #fff;
+      padding: 22px 28px;
+      border-radius: 12px;
+      box-shadow: 0 4px 12px rgba(0,0,0,.1);
+    }
+    header h1 { font-size: 22px; margin-bottom: 6px; }
+    header p { font-size: 13px; opacity: .92; }
+
+    .toolbar {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 12px;
+      margin: 18px 0;
+    }
+    .toolbar input, .toolbar select {
+      padding: 9px 12px;
+      border: 1px solid #ccc;
+      border-radius: 8px;
+      font-size: 14px;
+    }
+    .toolbar input { flex: 1; min-width: 180px; }
+    .btn {
+      padding: 9px 18px;
+      background: #e53935;
+      color: #fff;
+      border: none;
+      border-radius: 8px;
+      cursor: pointer;
+      font-size: 14px;
+      transition: background .2s;
+    }
+    .btn:hover { background: #c62828; }
+    .status { font-size: 13px; color: #666; margin-left: auto; }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      background: #fff;
+      border-radius: 12px;
+      overflow: hidden;
+      box-shadow: 0 2px 10px rgba(0,0,0,.06);
+    }
+    thead th {
+      background: #37474f;
+      color: #fff;
+      padding: 12px 10px;
+      font-size: 14px;
+      text-align: right;
+      cursor: pointer;
+      user-select: none;
+      white-space: nowrap;
+    }
+    thead th:first-child, thead th:nth-child(2), thead th:nth-child(3) { text-align: left; }
+    thead th:hover { background: #455a64; }
+    thead th .arrow { font-size: 11px; opacity: .8; }
+
+    tbody td {
+      padding: 10px;
+      border-bottom: 1px solid #eee;
+      font-size: 14px;
+      text-align: right;
+    }
+    tbody td:first-child, tbody td:nth-child(2), tbody td:nth-child(3) { text-align: left; }
+    tbody tr:hover { background: #fafafa; }
+
+    .code { color: #888; font-family: Consolas, monospace; }
+    .tag {
+      display: inline-block;
+      padding: 2px 8px;
+      border-radius: 4px;
+      font-size: 12px;
+      color: #fff;
+    }
+    .tag-ETF { background: #1e88e5; }
+    .tag-LOF { background: #8e24aa; }
+
+    .up { color: #e53935; font-weight: 600; }   /* 溢价 / 上涨：红 */
+    .down { color: #2e7d32; font-weight: 600; } /* 折价 / 下跌：绿 */
+
+    /* 套利机会高亮 */
+    .row-premium { background: #fff3e0 !important; }      /* 高溢价（卖出套利）浅橙 */
+    .row-premium:hover { background: #ffe0b2 !important; }
+    .row-discount { background: #e8f5e9 !important; }      /* 高折价（买入套利）浅绿 */
+    .row-discount:hover { background: #c8e6c9 !important; }
+    .badge {
+      display: inline-block;
+      padding: 1px 7px;
+      border-radius: 4px;
+      font-size: 11px;
+      color: #fff;
+      margin-left: 6px;
+    }
+    .badge-sell { background: #fb8c00; }   /* 卖出套利 */
+    .badge-buy  { background: #43a047; }   /* 买入套利 */
+
+    .empty { text-align: center; color: #999; padding: 40px; }
+    footer { text-align: center; color: #aaa; font-size: 12px; margin-top: 20px; line-height: 1.8; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <header>
+      <h1>场内基金溢价率排行</h1>
+      <p>溢价率 =（当日市价 − 当日预估净值IOPV）÷ 预估净值 × 100% ｜ 正数=溢价（红，可卖出套利）｜ 负数=折价（绿，可买入套利）｜ 超过阈值自动高亮并打标签</p>
+    </header>
+
+    <div class="toolbar">
+      <input id="search" type="text" placeholder="输入基金代码或名称搜索，例如 513350 或 原油" />
+      <select id="typeFilter">
+        <option value="">全部类型</option>
+        <option value="ETF">仅 ETF</option>
+        <option value="LOF">仅 LOF</option>
+      </select>
+      <select id="arbFilter">
+        <option value="all">全部（含折价/溢价）</option>
+        <option value="premium">仅溢价（市价&gt;净值）</option>
+        <option value="discount">仅折价（市价&lt;净值）</option>
+        <option value="highPremium">高溢价套利机会</option>
+        <option value="highDiscount">高折价套利机会</option>
+      </select>
+      <label style="font-size:13px;color:#666;display:flex;align-items:center;gap:6px;">
+        阈值%
+        <input id="threshold" type="number" value="5" step="0.5" style="width:70px;padding:8px;border:1px solid #ccc;border-radius:8px;" />
+      </label>
+      <button class="btn" id="refreshBtn">刷新数据</button>
+      <label style="font-size:13px;color:#666;display:flex;align-items:center;gap:6px;">
+        <input id="autoChk" type="checkbox" checked /> 自动刷新
+      </label>
+      <span class="status" id="status">加载中…</span>
+    </div>
+
+    <table>
+      <thead>
+        <tr>
+          <th data-key="code">代码</th>
+          <th data-key="name">名称</th>
+          <th data-key="type">类型</th>
+          <th data-key="price">当日市价</th>
+          <th data-key="iopv">预估净值</th>
+          <th data-key="change_pct">涨跌幅%</th>
+          <th data-key="premium">溢价率% <span class="arrow">▼</span></th>
+        </tr>
+      </thead>
+      <tbody id="tbody">
+        <tr><td class="empty" colspan="7">正在加载数据，请稍候…</td></tr>
+      </tbody>
+    </table>
+
+    <footer>
+      数据来源：AKShare（东方财富）｜ 数据每 60 秒缓存一次，点击“刷新数据”获取最新<br />
+      本页仅供学习与参考，不构成任何投资建议。基金交易需自行核实数据并注意费用与风险。
+    </footer>
+  </div>
+
+  <script>
+    let rawData = [];          // 原始全部数据
+    let sortKey = "premium";   // 当前排序字段
+    let sortAsc = false;       // 是否升序（默认溢价率降序）
+
+    const tbody = document.getElementById("tbody");
+    const statusEl = document.getElementById("status");
+    const searchEl = document.getElementById("search");
+    const typeEl = document.getElementById("typeFilter");
+    const arbEl = document.getElementById("arbFilter");
+    const thEl = document.getElementById("threshold");
+    const autoChk = document.getElementById("autoChk");
+
+    // 自动刷新：每 AUTO_INTERVAL 秒拉一次数据；带倒计时显示
+    const AUTO_INTERVAL = 60;
+    let countdown = AUTO_INTERVAL;
+    let timerId = null;
+
+    function tick() {
+      if (!autoChk.checked) {
+        statusEl.textContent = "自动刷新已关闭 ｜ 上次更新：" + lastUpdate;
+        return;
+      }
+      countdown -= 1;
+      if (countdown <= 0) {
+        countdown = AUTO_INTERVAL;
+        load();   // 触发刷新
+      }
+      statusEl.textContent = `共 ${lastCount} 只 ｜ 更新于 ${lastUpdate} ｜ ${countdown}s 后自动刷新`;
+    }
+
+    let lastUpdate = "-";
+    let lastCount = 0;
+
+    // 格式化数字
+    function fmt(v, digits = 3) {
+      if (v === null || v === undefined || isNaN(v)) return "-";
+      return Number(v).toFixed(digits);
+    }
+
+    // 判断某只基金是否属于“套利机会”（用于高亮 + 徽章）
+    function arbInfo(d) {
+      const t = parseFloat(thEl.value);
+      const thr = isNaN(t) ? 5 : t;
+      if (d.premium >= thr) return "sell";   // 高溢价：可卖出/赎回套利
+      if (d.premium <= -thr) return "buy";   // 高折价：可买入套利
+      return "";
+    }
+
+    // 渲染表格
+    function render() {
+      const kw = searchEl.value.trim().toLowerCase();
+      const type = typeEl.value;
+      const arb = arbEl.value;
+
+      let list = rawData.filter(d => {
+        const matchKw = !kw || d.code.toLowerCase().includes(kw) || d.name.toLowerCase().includes(kw);
+        const matchType = !type || d.type === type;
+        let matchArb = true;
+        if (arb === "premium") matchArb = d.premium > 0;
+        else if (arb === "discount") matchArb = d.premium < 0;
+        else if (arb === "highPremium") matchArb = d.premium >= parseFloat(thEl.value || 5);
+        else if (arb === "highDiscount") matchArb = d.premium <= -parseFloat(thEl.value || 5);
+        return matchKw && matchType && matchArb;
+      });
+
+      // 排序
+      list.sort((a, b) => {
+        let va = a[sortKey], vb = b[sortKey];
+        if (typeof va === "string") {
+          return sortAsc ? va.localeCompare(vb) : vb.localeCompare(va);
+        }
+        va = (va === null || va === undefined || isNaN(va)) ? -Infinity : va;
+        vb = (vb === null || vb === undefined || isNaN(vb)) ? -Infinity : vb;
+        return sortAsc ? va - vb : vb - va;
+      });
+
+      if (list.length === 0) {
+        tbody.innerHTML = '<tr><td class="empty" colspan="7">没有符合条件的基金</td></tr>';
+        return;
+      }
+
+      tbody.innerHTML = list.map(d => {
+        const pCls = d.premium > 0 ? "up" : (d.premium < 0 ? "down" : "");
+        const cCls = d.change_pct > 0 ? "up" : (d.change_pct < 0 ? "down" : "");
+        const sign = d.premium > 0 ? "+" : "";
+        const csign = d.change_pct > 0 ? "+" : "";
+        const arb = arbInfo(d);
+        const rowCls = arb === "sell" ? "row-premium" : (arb === "buy" ? "row-discount" : "");
+        const badge = arb === "sell" ? '<span class="badge badge-sell">卖出套利</span>'
+                    : arb === "buy" ? '<span class="badge badge-buy">买入套利</span>' : "";
+        return `<tr class="${rowCls}">
+          <td class="code">${d.code}</td>
+          <td>${d.name}${badge}</td>
+          <td><span class="tag tag-${d.type}">${d.type}</span></td>
+          <td>${fmt(d.price, 3)}</td>
+          <td>${fmt(d.iopv, 3)}</td>
+          <td class="${cCls}">${d.change_pct === null ? "-" : csign + fmt(d.change_pct, 2)}</td>
+          <td class="${pCls}">${sign}${fmt(d.premium, 3)}</td>
+        </tr>`;
+      }).join("");
+    }
+
+    // 更新表头排序箭头
+    function updateArrows() {
+      document.querySelectorAll("thead th").forEach(th => {
+        const arrow = th.querySelector(".arrow");
+        if (arrow) arrow.remove();
+        if (th.dataset.key === sortKey) {
+          const span = document.createElement("span");
+          span.className = "arrow";
+          span.textContent = sortAsc ? " ▲" : " ▼";
+          th.appendChild(span);
+        }
+      });
+    }
+
+    // 加载数据
+    async function load(refresh = false) {
+      statusEl.textContent = "加载中…";
+      try {
+        const url = refresh ? "/api/refresh" : "/api/premium";
+        const res = await fetch(url);
+        const json = await res.json();
+        if (!json.ok) {
+          statusEl.textContent = "出错：" + (json.error || "未知错误");
+          return;
+        }
+        rawData = json.data;
+        lastCount = json.count;
+        lastUpdate = json.update_time;
+        countdown = AUTO_INTERVAL;
+        statusEl.textContent = `共 ${json.count} 只 ｜ 更新于 ${json.update_time} ｜ ${countdown}s 后自动刷新`;
+        render();
+      } catch (e) {
+        statusEl.textContent = "网络错误：" + e.message;
+      }
+    }
+
+    // 表头点击排序
+    document.querySelectorAll("thead th").forEach(th => {
+      th.addEventListener("click", () => {
+        const key = th.dataset.key;
+        if (sortKey === key) {
+          sortAsc = !sortAsc;          // 再次点击切换升降序
+        } else {
+          sortKey = key;
+          sortAsc = false;             // 新字段默认降序
+        }
+        updateArrows();
+        render();
+      });
+    });
+
+    searchEl.addEventListener("input", render);
+    typeEl.addEventListener("change", render);
+    arbEl.addEventListener("change", render);
+    thEl.addEventListener("input", render);
+    autoChk.addEventListener("change", () => { countdown = AUTO_INTERVAL; tick(); });
+    document.getElementById("refreshBtn").addEventListener("click", () => load(true));
+
+    // 首次加载
+    load();
+    // 启动自动刷新倒计时（每 1 秒走一次）
+    timerId = setInterval(tick, 1000);
+  </script>
+</body>
+</html>
