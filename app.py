@@ -38,7 +38,8 @@ import akshare as ak
 import pandas as pd
 import requests
 import re
-from flask import Flask, jsonify, render_template
+import json
+from flask import Flask, jsonify, render_template, request
 
 # ETF / LOF 并行获取，LOF 连不上时最多等这么久，避免拖垮整页
 _LOF_TIMEOUT = 12
@@ -376,7 +377,123 @@ def get_fund_premium():
 
         _CACHE["data"] = all_records
         _CACHE["time"] = now
+        # 后台检查提醒（不阻塞接口响应）
+        threading.Thread(target=check_and_alert, daemon=True).start()
         return all_records
+
+
+# ---------------------------------------------------------------------------
+# 溢价套利提醒：当「开放申购」的 LOF 溢价率超过阈值时，推送到 微信/钉钉/飞书。
+# 配置保存在 alert_config.json（也可通过网页「提醒设置」弹窗修改）。
+# ---------------------------------------------------------------------------
+ALERT_CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "alert_config.json")
+_ALERT_COOLDOWN = 30 * 60  # 同一只基金两次推送的最小间隔（秒），避免刷屏
+_last_alert = {}            # {基金代码: 上次推送时间戳}
+
+
+def _default_alert_config():
+    return {"enabled": False, "platform": "dingtalk", "webhook": "", "threshold": 8.0}
+
+
+def load_alert_config():
+    try:
+        if os.path.exists(ALERT_CONFIG_PATH):
+            with open(ALERT_CONFIG_PATH, "r", encoding="utf-8") as f:
+                cfg = json.load(f)
+            d = _default_alert_config()
+            d.update(cfg)
+            return d
+    except Exception:
+        traceback.print_exc()
+    return _default_alert_config()
+
+
+def save_alert_config(cfg):
+    try:
+        with open(ALERT_CONFIG_PATH, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, ensure_ascii=False, indent=2)
+    except Exception:
+        traceback.print_exc()
+
+
+_ALERT_CFG = load_alert_config()
+_ALERT_CFG_LOCK = threading.Lock()
+
+
+def send_webhook(platform, url, text):
+    """按平台格式发送文本消息到 Webhook。返回是否成功。"""
+    if not url:
+        return False
+    try:
+        if platform == "serverchan":
+            # Server酱（推微信）：表单 title + desp
+            r = requests.post(url, data={"title": "基金溢价套利提醒", "desp": text}, timeout=10)
+        elif platform == "feishu":
+            r = requests.post(url, json={"msg_type": "text", "content": {"text": text}}, timeout=10)
+        else:  # dingtalk / wecom 企业微信
+            r = requests.post(url, json={"msgtype": "text", "text": {"content": text}}, timeout=10)
+        return r.status_code < 400
+    except Exception as e:
+        print("[提醒] 发送 Webhook 失败：", e)
+        return False
+
+
+def check_and_alert():
+    """扫描「开放申购」且溢价率超阈值的 LOF，推送提醒（带冷却去重）。"""
+    global _ALERT_CFG, _last_alert
+    cfg = _ALERT_CFG
+    if not cfg.get("enabled") or not cfg.get("webhook"):
+        return
+    if not is_trade_time():
+        return  # 仅在交易时段提醒，避免用隔夜陈旧数据误报
+    try:
+        data = get_fund_premium()
+        sub = get_subscribe_map()
+    except Exception:
+        traceback.print_exc()
+        return
+    try:
+        threshold = float(cfg.get("threshold") or 8)
+    except (TypeError, ValueError):
+        threshold = 8.0
+    now = time.time()
+    hits = []
+    for d in data:
+        if d.get("type") != "LOF":
+            continue
+        s = sub.get(d["code"])
+        if not s or s.get("cls") != "sub-open":
+            continue
+        prem = d.get("premium")
+        if prem is None or prem <= threshold:
+            continue
+        if now - _last_alert.get(d["code"], 0) < _ALERT_COOLDOWN:
+            continue
+        _last_alert[d["code"]] = now
+        hits.append(d)
+    if not hits:
+        return
+    lines = ["【基金溢价套利提醒】开放申购且溢价率>%.1f%% 的 LOF 共 %d 只："
+             % (threshold, len(hits))]
+    for d in hits:
+        amt = sub.get(d["code"], {}).get("amount", "")
+        lines.append("• %s(%s) 溢价率 %.2f%%，可申购%s"
+                     % (d["name"], d["code"], d["premium"],
+                        ("限额 " + amt if amt else "额度充足")))
+    lines.append("时间：%s" % time.strftime("%Y-%m-%d %H:%M:%S"))
+    text = "\n".join(lines)
+    ok = send_webhook(cfg.get("platform", "dingtalk"), cfg.get("webhook", ""), text)
+    print("[提醒] 已推送 %d 只基金，结果=%s" % (len(hits), ok))
+
+
+def _alert_scheduler():
+    """后台定时扫描（每 2 分钟一次），覆盖页面未打开但进程存活的情况。"""
+    while True:
+        time.sleep(120)
+        try:
+            check_and_alert()
+        except Exception:
+            pass
 
 
 @app.route("/")
@@ -423,6 +540,34 @@ def api_subscribe():
         return jsonify({"ok": False, "error": str(e), "data": {}})
 
 
+@app.route("/api/alert_config", methods=["GET"])
+def api_alert_config_get():
+    """返回当前提醒配置。"""
+    return jsonify({"ok": True, "config": dict(_ALERT_CFG)})
+
+
+@app.route("/api/alert_config", methods=["POST"])
+def api_alert_config_post():
+    """保存提醒配置（启用/平台/Webhook/阈值），并立即检测一次。"""
+    global _ALERT_CFG
+    try:
+        body = request.get_json(force=True, silent=True) or {}
+        with _ALERT_CFG_LOCK:
+            _ALERT_CFG["enabled"] = bool(body.get("enabled", _ALERT_CFG.get("enabled", False)))
+            _ALERT_CFG["platform"] = body.get("platform", _ALERT_CFG.get("platform", "dingtalk"))
+            _ALERT_CFG["webhook"] = (body.get("webhook") or "").strip()
+            try:
+                _ALERT_CFG["threshold"] = float(body.get("threshold", _ALERT_CFG.get("threshold", 8)))
+            except (TypeError, ValueError):
+                pass
+            save_alert_config(_ALERT_CFG)
+        # 保存后立即检测一次（便于验证 Webhook 是否可用）
+        threading.Thread(target=check_and_alert, daemon=True).start()
+        return jsonify({"ok": True, "config": dict(_ALERT_CFG)})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)})
+
+
 if __name__ == "__main__":
     import os as _os
 
@@ -437,6 +582,13 @@ if __name__ == "__main__":
         print(" 数据缓存预热完成（ETF/LOF 已就绪）。")
     except Exception:
         traceback.print_exc()
+
+    # 启动提醒后台扫描线程（每 2 分钟检查一次开放申购且高溢价的 LOF）
+    try:
+        threading.Thread(target=_alert_scheduler, daemon=True).start()
+        print(" 提醒扫描线程已启动。")
+    except Exception:
+        pass
 
     print("=" * 50)
     print(" 基金溢价率网站已启动！")
