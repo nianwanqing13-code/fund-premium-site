@@ -110,6 +110,10 @@
     .sub-open { color: #2e7d32; font-weight: 600; }
     .sub-limit { color: #ef6c00; font-weight: 600; }
     .sub-pause { color: #c62828; font-weight: 600; }
+    .sub-etf { color: #607d8b; font-weight: 600; }
+    .sub-na { color: #999; }
+    /* 可申购数额 */
+    .sub-amount { text-align: right; font-variant-numeric: tabular-nums; }
 
     /* 套利机会高亮 */
     .row-premium { background: #fff3e0 !important; }      /* 高溢价（卖出套利）浅橙 */
@@ -176,17 +180,18 @@
           <th data-key="change_pct">涨跌幅%</th>
           <th data-key="premium">溢价率% <span class="arrow">▼</span></th>
           <th data-key="subscribe">申购状态</th>
+          <th data-key="subscribe_amount">可申购数额</th>
           <th data-key="arrive">到账时间</th>
         </tr>
       </thead>
       <tbody id="tbody">
-        <tr><td class="empty" colspan="9">正在加载数据，请稍候…</td></tr>
+        <tr><td class="empty" colspan="10">正在加载数据，请稍候…</td></tr>
       </tbody>
     </table>
 
     <footer>
       数据来源：AKShare（东方财富）｜ 数据每 60 秒缓存一次，点击“刷新数据”获取最新<br />
-      申购状态来自开放式基金列表，ETF 场内申赎以交易所 / 基金公司公告为准<br />
+      申购状态与可申购数额（日累计申购限额）来自天天基金档案，仅 LOF 为场内现金申购故取真实状态；ETF 为实物申赎（需一篮子股票），以基金公司公告为准<br />
       到账时间为常规规则（LOF 场内申购 T+2 到账可卖，ETF 多为实物申赎约 T+1），具体以基金公司公告为准<br />
       本页仅供学习与参考，不构成任何投资建议。基金交易需自行核实数据并注意费用与风险。
     </footer>
@@ -245,10 +250,10 @@
 
     // 申购到账时间（按类型规则，暂停申购时不适用）
     function arriveText(d) {
-      const sub = subMap[d.code] || "";
-      if (sub.includes("暂停")) return "—";
+      if (d.type === "ETF") return "实物申赎";
+      const sub = subMap[d.code];
+      if (!sub || sub.cls === "sub-pause") return "—";
       if (d.type === "LOF") return "T+2";
-      if (d.type === "ETF") return "T+1";
       return "—";
     }
 
@@ -271,6 +276,13 @@
 
       // 排序
       list.sort((a, b) => {
+        // 可申购数额列：数值来自 subMap（单位：元），无数额排到末尾
+        if (sortKey === "subscribe_amount") {
+          const sa = subMap[a.code], sb = subMap[b.code];
+          const va = (sa && sa.amount_num != null) ? sa.amount_num : -Infinity;
+          const vb = (sb && sb.amount_num != null) ? sb.amount_num : -Infinity;
+          return sortAsc ? va - vb : vb - va;
+        }
         let va = a[sortKey], vb = b[sortKey];
         if (typeof va === "string") {
           return sortAsc ? va.localeCompare(vb) : vb.localeCompare(va);
@@ -281,7 +293,7 @@
       });
 
       if (list.length === 0) {
-        tbody.innerHTML = '<tr><td class="empty" colspan="9">没有符合条件的基金</td></tr>';
+        tbody.innerHTML = '<tr><td class="empty" colspan="10">没有符合条件的基金</td></tr>';
         return;
       }
 
@@ -294,12 +306,21 @@
         const rowCls = arb === "sell" ? "row-premium" : (arb === "buy" ? "row-discount" : "");
         const badge = arb === "sell" ? '<span class="badge badge-sell">卖出套利</span>'
                     : arb === "buy" ? '<span class="badge badge-buy">买入套利</span>' : "";
-        // 申购状态：暂停(红) / 限大额(橙) / 开放(绿)
-        const subTxt = subMap[d.code] || "";
-        let subCls = "";
-        if (subTxt.includes("暂停")) subCls = "sub-pause";
-        else if (subTxt.includes("限")) subCls = "sub-limit";
-        else if (subTxt.includes("开放")) subCls = "sub-open";
+        // 申购状态：LOF 取真实状态；ETF 为实物申赎
+        let subHtml, amtHtml;
+        if (d.type === "ETF") {
+          subHtml = '<td class="sub-status sub-etf">ETF·实物申赎</td>';
+          amtHtml = '<td class="sub-amount">-</td>';
+        } else {
+          const sub = subMap[d.code];
+          if (!sub) {
+            subHtml = '<td class="sub-status">-</td>';
+            amtHtml = '<td class="sub-amount">-</td>';
+          } else {
+            subHtml = `<td class="sub-status ${sub.cls}">${sub.label}</td>`;
+            amtHtml = `<td class="sub-amount">${sub.amount ? sub.amount : "-"}</td>`;
+          }
+        }
         return `<tr class="${rowCls}">
           <td class="code">${d.code}</td>
           <td>${d.name}${badge}</td>
@@ -308,7 +329,8 @@
           <td>${fmt(d.iopv, 3)}</td>
           <td class="${cCls}">${d.change_pct === null ? "-" : csign + fmt(d.change_pct, 2)}</td>
           <td class="${pCls}">${sign}${fmt(d.premium, 3)}</td>
-          <td class="sub-status ${subCls}">${subTxt || "-"}</td>
+          ${subHtml}
+          ${amtHtml}
           <td class="arrive">${arriveText(d)}</td>
         </tr>`;
       }).join("");
@@ -329,6 +351,7 @@
     }
 
     // 异步加载申购状态映射（不阻塞主数据展示）
+    let subPollCount = 0;
     async function loadSubscribe() {
       try {
         const res = await fetch("/api/subscribe");
@@ -336,6 +359,11 @@
         if (json.ok) {
           subMap = json.data || {};
           render();   // 重新渲染以填充申购状态列
+          // 首屏数据未就绪时，短暂轮询补齐（后台构建约需数十秒）
+          if (Object.keys(subMap).length === 0 && subPollCount < 4) {
+            subPollCount += 1;
+            setTimeout(loadSubscribe, 15000);
+          }
         }
       } catch (e) {
         // 忽略错误，申购状态列保持“-”

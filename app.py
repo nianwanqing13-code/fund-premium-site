@@ -10,7 +10,8 @@
    - 溢价率 > 0 表示溢价（市价比净值贵，可能存在卖出/赎回套利机会）
    - 溢价率 < 0 表示折价（市价比净值便宜，可能存在买入套利机会）
 3. 提供网页和数据接口，支持按溢价率排序。
-4. 展示每只基金的「申购状态」（开放申购 / 暂停申购）与「申购时间」。
+4. 展示每只 LOF 的「申购状态」（开放申购 / 限大额 / 暂停申购）与「可申购数额」，
+   ETF 标注为实物申赎；并展示「申购时间」。
 
 运行方式：
    双击 “启动网站.bat”，或在命令行执行：
@@ -36,6 +37,7 @@ from concurrent.futures import ThreadPoolExecutor
 import akshare as ak
 import pandas as pd
 import requests
+import re
 from flask import Flask, jsonify, render_template
 
 # ETF / LOF 并行获取，LOF 连不上时最多等这么久，避免拖垮整页
@@ -63,65 +65,128 @@ def is_trade_time():
 
 
 # ---------------------------------------------------------------------------
-# 基金申购状态（开放申购 / 暂停申购）：来自 AKShare 开放式基金列表，独立缓存，
-# 失败时不影响主溢价数据。ETF / LOF 的 6 位代码一般都能在该列表匹配到，
-# 匹配不到则前端显示“-”。
+# 基金申购状态（开放申购 / 限大额 / 暂停申购）与可申购数额（日累计申购限额）：
+# 来自天天基金「基金费率」档案页 jjfl_<代码>.html。
+# 仅对 LOF 取数——LOF 支持场内现金申购，申购状态/限额对溢价套利直接有意义；
+# ETF 为实物申赎（需一篮子股票），其现金申购状态指向场外联接基金，故单列说明。
+# 失败时不影响主溢价数据。
 # ---------------------------------------------------------------------------
 _SUBSCRIBE_CACHE = {"map": None, "time": 0}
-_SUBSCRIBE_TTL = 600  # 10 分钟
+_SUBSCRIBE_TTL = 3600  # 1 小时（申购状态/限额日内很少变动）
+_SUB_BUILDING = False   # 后台构建标志，避免并发重复触发
+
+_JJFL_RE_STATUS = re.compile(r"交易状态：<span>([^<]+)</span>")
+_JJFL_RE_LIMIT = re.compile(r"日累计申购限额</td><td[^>]*>([^<]+)</td>")
 
 
-def _normalize_subscribe_status(raw):
-    """把数据源返回的原始申购状态字符串标准化为可展示的中文标签。
+def _fetch_subscribe_one(code):
+    """抓取单只 LOF 的申购状态与日累计申购限额，返回 (status, limit)。"""
+    try:
+        r = requests.get(
+            "https://fundf10.eastmoney.com/jjfl_%s.html" % code,
+            headers=_LOF_HEADERS, timeout=8,
+        )
+        t = r.text
+        m = _JJFL_RE_STATUS.search(t)
+        status = m.group(1).strip() if m else ""
+        m2 = _JJFL_RE_LIMIT.search(t)
+        limit = m2.group(1).strip() if m2 else ""
+        return status, limit
+    except Exception:
+        return "", ""
 
-    参考业界做法（如 arbitrage-alert）：按关键字匹配「暂停 / 限 / 开放」。
-    - 含“暂停” -> 暂停申购（不可申购）
-    - 含“限”   -> 限大额（可申购但限额）
-    - 含“开放” -> 开放申购（正常可申购）
-    - 空 / NaN  -> 空串（前端显示“-”）
+
+def _parse_limit_to_num(limit):
+    """把「日累计申购限额」文本解析为数值（单位：元），无法解析返回 None。
+
+    例："50.00万元" -> 500000.0，"1000.00元" -> 1000.0，"无" -> None。
+    用于前端对「可申购数额」列排序。
     """
-    if raw is None:
-        return ""
-    s = str(raw).strip()
-    if s in ("", "nan", "None"):
-        return ""
+    s = (limit or "").strip()
+    if not s or "无" in s:
+        return None
+    m = re.search(r"([\d,]+(?:\.\d+)?)\s*(万|亿)?", s)
+    if not m:
+        return None
+    try:
+        num = float(m.group(1).replace(",", ""))
+    except ValueError:
+        return None
+    unit = m.group(2)
+    if unit == "万":
+        num *= 10000
+    elif unit == "亿":
+        num *= 100000000
+    return num
+
+
+def _normalize_subscribe(status, limit):
+    """把原始「交易状态」与「日累计申购限额」整理成展示用的 (label, amount, cls, amount_num)。
+
+    返回 (label, amount, cls, amount_num)：
+      - label     : 展示文字（含可否申购的判断）
+      - amount    : 可申购数额文字（仅“可申购”时有值，否则为空）
+      - cls       : 前端配色类名 sub-open / sub-limit / sub-pause / sub-na
+      - amount_num: 可申购数额的数值（单位：元），用于排序；无法解析为 None
+    """
+    s = (status or "").strip()
+    if s == "":
+        return ("", "", "sub-na", None)
     if "暂停" in s:
-        return "暂停申购"
+        # 暂停申购：不可申购，限额无意义
+        return ("暂停申购（不可申购）", "", "sub-pause", None)
     if "限" in s:
-        return "限大额"
+        # 限大额：可申购，但有限额 -> 数额即“可申购的数额”
+        amt = (limit or "").strip()
+        if amt and "无" not in amt:
+            return ("限大额·可申购", amt, "sub-limit", _parse_limit_to_num(amt))
+        return ("限大额·可申购", "", "sub-limit", None)
     if "开放" in s:
-        return "开放申购"
-    return s
+        amt = (limit or "").strip()
+        if amt and "无" not in amt:
+            return ("开放申购·可申购", amt, "sub-open", _parse_limit_to_num(amt))
+        return ("开放申购·可申购", "", "sub-open", None)
+    return (s, "", "sub-na", None)
+
+
+def _build_subscribe_map():
+    """后台线程：抓取全部 LOF 的申购状态与数额，写入缓存。"""
+    global _SUBSCRIBE_CACHE, _SUB_BUILDING
+    _SUB_BUILDING = True
+    try:
+        lof_df = fetch_lof_list()
+        codes = [str(c).strip() for c in lof_df["代码"].tolist() if str(c).strip()]
+        # 并行抓取每只 LOF 的申购信息（约数百只，受天天基金节流影响可能需数十秒）
+        with ThreadPoolExecutor(max_workers=16) as pool:
+            results = pool.map(_fetch_subscribe_one, codes)
+        m = {}
+        for code, (status, limit) in zip(codes, results):
+            label, amount, cls, amount_num = _normalize_subscribe(status, limit)
+            if label:
+                m[code] = {"label": label, "amount": amount, "cls": cls, "amount_num": amount_num}
+        _SUBSCRIBE_CACHE["map"] = m
+        _SUBSCRIBE_CACHE["time"] = time.time()
+    except Exception:
+        traceback.print_exc()
+        if _SUBSCRIBE_CACHE["map"] is None:
+            _SUBSCRIBE_CACHE["map"] = {}
+    finally:
+        _SUB_BUILDING = False
 
 
 def get_subscribe_map():
-    """返回 {基金代码: 申购状态} 映射，带缓存。"""
-    global _SUBSCRIBE_CACHE
+    """返回 {LOF代码: {label, amount, cls}} 映射。
+
+    命中 1 小时缓存则直接返回；否则立即返回当前已有内容（可能为空），
+    并在后台启动一次完整构建，前端通过自动刷新自然补齐。
+    """
+    global _SUBSCRIBE_CACHE, _SUB_BUILDING
     now = time.time()
     if _SUBSCRIBE_CACHE["map"] is not None and (now - _SUBSCRIBE_CACHE["time"] < _SUBSCRIBE_TTL):
         return _SUBSCRIBE_CACHE["map"]
-    try:
-        df = ak.fund_open_fund_info_em()
-        col = None
-        for c in ["申购状态", "申购", "开放申购"]:
-            if c in df.columns:
-                col = c
-                break
-        m = {}
-        if col:
-            for _, row in df.iterrows():
-                code = str(row.get("基金代码", "")).strip()
-                if code:
-                    m[code] = _normalize_subscribe_status(row.get(col, ""))
-        _SUBSCRIBE_CACHE["map"] = m
-        _SUBSCRIBE_CACHE["time"] = now
-        return m
-    except Exception:
-        traceback.print_exc()
-        # 获取失败时，若已有旧缓存就继续用旧数据，否则返回空映射
-        if _SUBSCRIBE_CACHE["map"] is None:
-            _SUBSCRIBE_CACHE["map"] = {}
-        return _SUBSCRIBE_CACHE["map"]
+    if not _SUB_BUILDING:
+        threading.Thread(target=_build_subscribe_map, daemon=True).start()
+    return _SUBSCRIBE_CACHE["map"] or {}
 
 
 def _to_float(value):
