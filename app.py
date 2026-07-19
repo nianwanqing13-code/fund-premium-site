@@ -28,11 +28,14 @@ os.environ["no_proxy"] = "*"
 
 import time
 import datetime
+import math
 import traceback
+import threading
 from concurrent.futures import ThreadPoolExecutor
 
 import akshare as ak
 import pandas as pd
+import requests
 from flask import Flask, jsonify, render_template
 
 # ETF / LOF 并行获取，LOF 连不上时最多等这么久，避免拖垮整页
@@ -45,6 +48,7 @@ app = Flask(__name__)
 # ---------------------------------------------------------------------------
 _CACHE = {"data": None, "time": 0}
 _CACHE_SECONDS = 60
+_fetch_lock = threading.Lock()   # 防止并发请求各自触发一次完整抓取
 
 
 def is_trade_time():
@@ -134,6 +138,106 @@ def _to_float(value):
         return None
 
 
+# ---------------------------------------------------------------------------
+# LOF 行情：自行抓取东方财富接口
+# 说明：
+#   - akshare 的 fund_lof_spot_em() 当前会触发东方财富连接重置(RemoteDisconnected)，
+#     且返回字段里没有 IOPV，无法计算溢价率。这里改用 push2delay 主机 + 浏览器
+#     请求头 + 分页拉取全部，稳定返回；LOF 没有实时 IOPV，改用
+#     f402「折价率」反推溢价率：溢价率 = -折价率。
+#   - 东方财富 clist 接口默认每页 100 条、超大 pz 会被静默钳回 100，因此必须像
+#     akshare 一样先取 total 再分页遍历，才能拿全量数据。
+# ---------------------------------------------------------------------------
+_LOF_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                  "(KHTML, like Gecko) Chrome/120.0 Safari/537.36",
+    "Referer": "https://quote.eastmoney.com/",
+    "Accept": "application/json, text/plain, */*",
+}
+
+
+def _fetch_eastmoney_clist(fs, fields, page_size=1000):
+    """分页抓取东方财富 clist 接口，返回原始字段 dict 的列表（list[dict]）。"""
+    url = "https://push2delay.eastmoney.com/api/qt/clist/get"
+    base = {
+        "pn": "1", "pz": str(page_size), "po": "1", "np": "1",
+        "ut": "bd1d9ddb04089700cf9c27f6f7426281",
+        "fltt": "2", "invt": "2", "wbp2u": "|0|0|0|web",
+        "fid": "f3",
+        "fs": fs,
+        "fields": fields,
+    }
+    all_diff = []
+    last_err = None
+    for attempt in range(4):
+        try:
+            r = requests.get(url, params=base, headers=_LOF_HEADERS, timeout=15)
+            r.raise_for_status()
+            data = r.json().get("data") or {}
+            total = data.get("total") or 0
+            diff = data.get("diff") or []
+            if not diff:
+                last_err = Exception("返回数据为空")
+                time.sleep(1 + (attempt % 3))
+                continue
+            all_diff.extend(diff)
+            per_page = len(diff)
+            pages = max(1, math.ceil(total / per_page)) if total else 1
+            # 翻剩余页（去掉 akshare 的 0.5~1.5s 随机延迟，仅留极短间隔，提速明显）
+            for pn in range(2, pages + 1):
+                p = dict(base)
+                p["pn"] = str(pn)
+                rr = requests.get(url, params=p, headers=_LOF_HEADERS, timeout=15)
+                d2 = (rr.json().get("data") or {}).get("diff") or []
+                all_diff.extend(d2)
+                time.sleep(0.1)
+            return all_diff
+        except Exception as e:
+            last_err = e
+            time.sleep(1 + (attempt % 3))
+    if last_err:
+        print("[警告] 获取基金列表失败：", last_err)
+    return all_diff
+
+
+def fetch_lof_list():
+    """抓取东方财富 LOF 实时行情，返回 pandas.DataFrame（含 代码/名称/最新价/涨跌幅/折价率）。"""
+    diff = _fetch_eastmoney_clist(
+        fs="b:MK0404,b:MK0405,b:MK0406,b:MK0407",
+        fields="f12,f14,f2,f3,f402",
+    )
+    rows = [
+        {
+            "代码": str(it.get("f12", "")).strip(),
+            "名称": str(it.get("f14", "")).strip(),
+            "最新价": it.get("f2"),
+            "涨跌幅": it.get("f3"),
+            "折价率": it.get("f402"),
+        }
+        for it in diff
+    ]
+    return pd.DataFrame(rows, columns=["代码", "名称", "最新价", "涨跌幅", "折价率"])
+
+
+def fetch_etf_list():
+    """抓取东方财富 ETF 实时行情（含 IOPV f441）。"""
+    diff = _fetch_eastmoney_clist(
+        fs="b:MK0021,b:MK0022,b:MK0023,b:MK0024,b:MK0827",
+        fields="f12,f14,f2,f3,f441",
+    )
+    rows = [
+        {
+            "代码": str(it.get("f12", "")).strip(),
+            "名称": str(it.get("f14", "")).strip(),
+            "最新价": it.get("f2"),
+            "涨跌幅": it.get("f3"),
+            "IOPV实时估值": it.get("f441"),
+        }
+        for it in diff
+    ]
+    return pd.DataFrame(rows, columns=["代码", "名称", "最新价", "涨跌幅", "IOPV实时估值"])
+
+
 def _fetch_one(fund_type, fetch_func):
     """
     获取一类基金（ETF 或 LOF）的实时行情并整理成统一格式。
@@ -147,13 +251,20 @@ def _fetch_one(fund_type, fetch_func):
 
         for _, row in df.iterrows():
             price = _to_float(row.get("最新价"))
-            iopv = _to_float(row.get("IOPV实时估值"))
 
-            # 没有市价或没有预估净值、或净值<=0 的，无法计算溢价率，跳过
-            if price is None or iopv is None or iopv <= 0:
-                continue
-
-            premium = (price - iopv) / iopv * 100.0
+            if fund_type == "LOF":
+                # LOF 没有实时 IOPV，用「折价率」反推：折价率=(净值-市价)/净值，负数为溢价
+                disc = _to_float(row.get("折价率"))
+                if price is None or disc is None:
+                    continue
+                premium = -disc
+                iopv_val = None
+            else:
+                iopv = _to_float(row.get("IOPV实时估值"))
+                if price is None or iopv is None or iopv <= 0:
+                    continue
+                premium = (price - iopv) / iopv * 100.0
+                iopv_val = iopv
 
             records.append(
                 {
@@ -161,7 +272,7 @@ def _fetch_one(fund_type, fetch_func):
                     "name": str(row.get("名称", "")).strip(),
                     "type": fund_type,
                     "price": round(price, 4),          # 当日市价
-                    "iopv": round(iopv, 4),            # 当日预估净值
+                    "iopv": round(iopv_val, 4) if iopv_val is not None else None,  # 预估净值(LOF 无)
                     "premium": round(premium, 3),      # 溢价率(%)
                     "change_pct": _to_float(row.get("涨跌幅")),  # 当日涨跌幅(%)
                 }
@@ -175,29 +286,32 @@ def _fetch_one(fund_type, fetch_func):
 
 def get_fund_premium():
     """获取全部场内基金的溢价率数据（带缓存）。"""
+    global _CACHE
     now = time.time()
     if _CACHE["data"] is not None and (now - _CACHE["time"] < _CACHE_SECONDS):
         return _CACHE["data"]
 
-    all_records = []
+    # 加锁避免并发请求各自触发一次完整抓取（接口较慢，并发会互相拖慢）
+    with _fetch_lock:
+        now = time.time()
+        if _CACHE["data"] is not None and (now - _CACHE["time"] < _CACHE_SECONDS):
+            return _CACHE["data"]
 
-    # ETF 与 LOF 并行获取：LOF 连不上时最多等 _LOF_TIMEOUT 秒，
-    # 避免它长时间重试把整页拖垮，ETF 数据始终能正常返回。
-    with ThreadPoolExecutor(max_workers=2) as pool:
-        f_etf = pool.submit(_fetch_one, "ETF", ak.fund_etf_spot_em)
-        f_lof = pool.submit(_fetch_one, "LOF", ak.fund_lof_spot_em)
-        all_records += f_etf.result()              # ETF 一般很快
-        try:
-            all_records += f_lof.result(_LOF_TIMEOUT)
-        except Exception:
-            print("[提示] LOF 数据获取超时，本次仅展示 ETF。")
+        all_records = []
 
-    # 默认按溢价率从高到低排序
-    all_records.sort(key=lambda x: x["premium"], reverse=True)
+        # ETF 与 LOF 并行获取（均为自行请求 push2delay，单页拉取，约数秒完成）
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            f_etf = pool.submit(_fetch_one, "ETF", fetch_etf_list)
+            f_lof = pool.submit(_fetch_one, "LOF", fetch_lof_list)
+            all_records += f_etf.result()
+            all_records += f_lof.result()
 
-    _CACHE["data"] = all_records
-    _CACHE["time"] = now
-    return all_records
+        # 默认按溢价率从高到低排序
+        all_records.sort(key=lambda x: x["premium"], reverse=True)
+
+        _CACHE["data"] = all_records
+        _CACHE["time"] = now
+        return all_records
 
 
 @app.route("/")
@@ -251,6 +365,13 @@ if __name__ == "__main__":
     port = int(_os.environ.get("PORT", 5000))
     host = _os.environ.get("HOST", "0.0.0.0")
     is_cloud = bool(_os.environ.get("PORT")) or _os.environ.get("RENDER") is not None
+
+    # 启动前预热数据缓存，避免首个请求因抓取耗时过长而超时
+    try:
+        get_fund_premium()
+        print(" 数据缓存预热完成（ETF/LOF 已就绪）。")
+    except Exception:
+        traceback.print_exc()
 
     print("=" * 50)
     print(" 基金溢价率网站已启动！")
