@@ -137,54 +137,28 @@
     /* 表格横向滚动容器（窄屏防御，避免任何溢出） */
     .table-wrap { width: 100%; overflow-x: auto; -webkit-overflow-scrolling: touch; }
 
-    /* ===== 手机端适配（≤768px）：表格转为卡片列表 ===== */
+    /* ===== 手机端适配（≤768px）：保留 PC 表格结构，等比缩小字号/间距，横向滚动 ===== */
     @media (max-width: 768px) {
       body { padding: 10px; }
       .container { max-width: 100%; }
-      header { padding: 16px; }
-      header h1 { font-size: 18px; }
-      header p { font-size: 11px; line-height: 1.5; }
+      header { padding: 14px 16px; }
+      header h1 { font-size: 17px; }
+      header p { font-size: 10px; line-height: 1.5; }
 
       .toolbar { gap: 8px; }
       .toolbar input { flex: 1 1 100%; min-width: 0; }
       .toolbar select { flex: 1 1 calc(50% - 4px); }
       .toolbar .btn { flex: 1 1 calc(50% - 4px); }
       .toolbar label { font-size: 12px; }
-      .toolbar .status { flex: 1 1 100%; margin-left: 0; text-align: left; }
-      .subbar { font-size: 12px; padding: 8px 12px; }
+      .toolbar .status { flex: 1 1 100%; margin-left: 0; text-align: left; font-size: 11px; }
+      .subbar { font-size: 11px; padding: 8px 12px; }
 
-      .table-wrap { overflow: visible; }
-      table, thead, tbody, tr, td { display: block; width: 100%; }
-      thead { display: none; }
-      table { background: transparent; box-shadow: none; border-radius: 0; }
+      /* 表格保持 PC 排版不变，仅整体等比缩小，外层可左右滑动 */
+      .table-wrap { overflow-x: auto; -webkit-overflow-scrolling: touch; }
+      table { width: 100%; min-width: 720px; }
+      thead th { padding: 8px 6px; font-size: 12px; }
+      tbody td { padding: 7px 6px; font-size: 12px; }
 
-      tbody tr {
-        background: #fff;
-        border: 1px solid #eee;
-        border-radius: 10px;
-        margin-bottom: 10px;
-        padding: 4px 12px;
-        box-shadow: 0 1px 4px rgba(0,0,0,.05);
-      }
-      tbody tr:hover { background: #fff; }
-      tbody td {
-        display: flex;
-        justify-content: space-between;
-        align-items: center;
-        padding: 9px 2px;
-        border-bottom: 1px dashed #eee;
-        font-size: 13px;
-        text-align: right;
-      }
-      tbody td:last-child { border-bottom: none; }
-      tbody td::before {
-        content: attr(data-label);
-        font-weight: 600;
-        color: #555;
-        text-align: left;
-        margin-right: 12px;
-        flex-shrink: 0;
-      }
       .empty { text-align: center; padding: 30px 10px; }
       footer { font-size: 11px; }
     }
