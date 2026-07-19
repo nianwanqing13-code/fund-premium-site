@@ -79,8 +79,9 @@ python app.py
 ## 接口
 
 - `GET /`：网页
-- `GET /api/premium`：返回全部基金溢价率 JSON
+- `GET /api/premium`：返回全部基金溢价率 JSON（含申购时间提示）
 - `GET /api/refresh`：强制刷新缓存后返回最新数据
+- `GET /api/subscribe`：返回 `{基金代码: {label, amount, cls, amount_num}}` 申购状态与可申购数额映射（`amount_num` 为以元为单位的数值，供排序）
 
 ---
 
