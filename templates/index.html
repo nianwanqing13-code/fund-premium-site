@@ -50,6 +50,16 @@
     .btn:hover { background: #c62828; }
     .status { font-size: 13px; color: #666; margin-left: auto; }
 
+    /* 申购时间提示条 */
+    .subbar {
+      background: #e3f2fd;
+      color: #1565c0;
+      padding: 10px 16px;
+      border-radius: 8px;
+      font-size: 13px;
+      margin: 14px 0;
+    }
+
     table {
       width: 100%;
       border-collapse: collapse;
@@ -94,6 +104,12 @@
 
     .up { color: #e53935; font-weight: 600; }   /* 溢价 / 上涨：红 */
     .down { color: #2e7d32; font-weight: 600; } /* 折价 / 下跌：绿 */
+
+    /* 申购状态 */
+    .sub-status { text-align: center; }
+    .sub-open { color: #2e7d32; font-weight: 600; }
+    .sub-limit { color: #ef6c00; font-weight: 600; }
+    .sub-pause { color: #c62828; font-weight: 600; }
 
     /* 套利机会高亮 */
     .row-premium { background: #fff3e0 !important; }      /* 高溢价（卖出套利）浅橙 */
@@ -147,6 +163,8 @@
       <span class="status" id="status">加载中…</span>
     </div>
 
+    <div class="subbar" id="subBar">申购时间：交易日 9:30-11:30、13:00-15:00（法定节假日除外）</div>
+
     <table>
       <thead>
         <tr>
@@ -157,26 +175,30 @@
           <th data-key="iopv">预估净值</th>
           <th data-key="change_pct">涨跌幅%</th>
           <th data-key="premium">溢价率% <span class="arrow">▼</span></th>
+          <th data-key="subscribe">申购状态</th>
         </tr>
       </thead>
       <tbody id="tbody">
-        <tr><td class="empty" colspan="7">正在加载数据，请稍候…</td></tr>
+        <tr><td class="empty" colspan="8">正在加载数据，请稍候…</td></tr>
       </tbody>
     </table>
 
     <footer>
       数据来源：AKShare（东方财富）｜ 数据每 60 秒缓存一次，点击“刷新数据”获取最新<br />
+      申购状态来自开放式基金列表，ETF 场内申赎以交易所 / 基金公司公告为准<br />
       本页仅供学习与参考，不构成任何投资建议。基金交易需自行核实数据并注意费用与风险。
     </footer>
   </div>
 
   <script>
     let rawData = [];          // 原始全部数据
+    let subMap = {};           // 基金代码 -> 申购状态 映射（异步加载）
     let sortKey = "premium";   // 当前排序字段
     let sortAsc = false;       // 是否升序（默认溢价率降序）
 
     const tbody = document.getElementById("tbody");
     const statusEl = document.getElementById("status");
+    const subBar = document.getElementById("subBar");
     const searchEl = document.getElementById("search");
     const typeEl = document.getElementById("typeFilter");
     const arbEl = document.getElementById("arbFilter");
@@ -248,7 +270,7 @@
       });
 
       if (list.length === 0) {
-        tbody.innerHTML = '<tr><td class="empty" colspan="7">没有符合条件的基金</td></tr>';
+        tbody.innerHTML = '<tr><td class="empty" colspan="8">没有符合条件的基金</td></tr>';
         return;
       }
 
@@ -261,6 +283,12 @@
         const rowCls = arb === "sell" ? "row-premium" : (arb === "buy" ? "row-discount" : "");
         const badge = arb === "sell" ? '<span class="badge badge-sell">卖出套利</span>'
                     : arb === "buy" ? '<span class="badge badge-buy">买入套利</span>' : "";
+        // 申购状态：暂停(红) / 限大额(橙) / 开放(绿)
+        const subTxt = subMap[d.code] || "";
+        let subCls = "";
+        if (subTxt.includes("暂停")) subCls = "sub-pause";
+        else if (subTxt.includes("限")) subCls = "sub-limit";
+        else if (subTxt.includes("开放")) subCls = "sub-open";
         return `<tr class="${rowCls}">
           <td class="code">${d.code}</td>
           <td>${d.name}${badge}</td>
@@ -269,6 +297,7 @@
           <td>${fmt(d.iopv, 3)}</td>
           <td class="${cCls}">${d.change_pct === null ? "-" : csign + fmt(d.change_pct, 2)}</td>
           <td class="${pCls}">${sign}${fmt(d.premium, 3)}</td>
+          <td class="sub-status ${subCls}">${subTxt || "-"}</td>
         </tr>`;
       }).join("");
     }
@@ -287,6 +316,20 @@
       });
     }
 
+    // 异步加载申购状态映射（不阻塞主数据展示）
+    async function loadSubscribe() {
+      try {
+        const res = await fetch("/api/subscribe");
+        const json = await res.json();
+        if (json.ok) {
+          subMap = json.data || {};
+          render();   // 重新渲染以填充申购状态列
+        }
+      } catch (e) {
+        // 忽略错误，申购状态列保持“-”
+      }
+    }
+
     // 加载数据
     async function load(refresh = false) {
       statusEl.textContent = "加载中…";
@@ -303,7 +346,13 @@
         lastUpdate = json.update_time;
         countdown = AUTO_INTERVAL;
         statusEl.textContent = `共 ${json.count} 只 ｜ 更新于 ${json.update_time} ｜ ${countdown}s 后自动刷新`;
+        // 申购时间提示
+        if (json.subscribe_info) {
+          const si = json.subscribe_info;
+          subBar.textContent = `申购时间：${si.period} ｜ 当前状态：${si.state}`;
+        }
         render();
+        loadSubscribe();   // 主数据就绪后再异步拉申购状态
       } catch (e) {
         statusEl.textContent = "网络错误：" + e.message;
       }
