@@ -333,6 +333,11 @@
 
     // 渲染表格
     function render() {
+      // 首屏数据尚未就绪（冷启动/后台抓取中）：先显示加载提示，待自动刷新补齐
+      if (rawData.length === 0) {
+        tbody.innerHTML = '<tr><td class="empty" colspan="10">数据加载中，即将自动刷新…</td></tr>';
+        return;
+      }
       const kw = searchEl.value.trim().toLowerCase();
       const type = typeEl.value;
       const arb = arbEl.value;
@@ -460,6 +465,10 @@
         lastUpdate = json.update_time;
         countdown = AUTO_INTERVAL;
         statusEl.textContent = `共 ${json.count} 只 ｜ 更新于 ${json.update_time} ｜ ${countdown}s 后自动刷新`;
+        // 首屏数据尚未就绪（冷启动/后台抓取中）：缩短重试间隔，尽快补齐
+        if (json.count === 0 && !refresh) {
+          countdown = 5;
+        }
         // 申购时间提示
         if (json.subscribe_info) {
           const si = json.subscribe_info;
