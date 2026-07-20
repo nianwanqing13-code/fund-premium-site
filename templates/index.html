@@ -255,6 +255,11 @@
         <label class="row">溢价率阈值 %
           <input id="alertThreshold" type="number" value="8" step="0.5" />
         </label>
+        <div class="row" style="font-size:12px;color:#888;">
+          你的专属链接（分享给朋友，各自提醒配置独立）：
+          <input id="myLink" type="text" readonly style="margin-top:4px;font-size:12px;" />
+          <button class="btn btn-ghost" id="copyLink" type="button" style="margin-top:6px;padding:6px 12px;">复制链接</button>
+        </div>
         <div class="modal-actions">
           <button class="btn" id="alertSave">保存</button>
           <button class="btn btn-ghost" id="alertClose">取消</button>
@@ -272,6 +277,23 @@
   </div>
 
   <script>
+    // ---- 用户标识（多人独立提醒配置）----
+    // 优先取 URL 的 ?u= 参数；否则用浏览器本地存储的 key（首次自动生成）。
+    // 自己打开网站无感（本地 key），分享带 ?u= 的链接给朋友则各自独立配置。
+    function getMyKey() {
+      const params = new URLSearchParams(location.search);
+      let k = params.get("u");
+      if (k) { localStorage.setItem("fp_key", k); return k; }
+      k = localStorage.getItem("fp_key");
+      if (!k) { k = "u_" + Math.random().toString(36).slice(2, 10); localStorage.setItem("fp_key", k); }
+      return k;
+    }
+    const MY_KEY = getMyKey();
+    // 若当前 URL 没有 ?u=，悄悄补上，方便用户直接复制地址栏分享
+    if (!new URLSearchParams(location.search).get("u")) {
+      history.replaceState(null, "", location.pathname + "?u=" + encodeURIComponent(MY_KEY));
+    }
+
     let rawData = [];          // 原始全部数据
     let subMap = {};           // 基金代码 -> 申购状态 映射（异步加载）
     let sortKey = "premium";   // 当前排序字段
@@ -453,7 +475,7 @@
     async function load(refresh = false) {
       statusEl.textContent = "加载中…";
       try {
-        const url = refresh ? "/api/refresh" : "/api/premium";
+        const url = (refresh ? "/api/refresh" : "/api/premium") + "?u=" + encodeURIComponent(MY_KEY);
         const res = await fetch(url);
         const json = await res.json();
         if (!json.ok) {
@@ -517,7 +539,7 @@
     alertBtn.addEventListener("click", async () => {
       alertMsg.textContent = "";
       try {
-        const res = await fetch("/api/alert_config");
+        const res = await fetch("/api/alert_config?u=" + encodeURIComponent(MY_KEY));
         const json = await res.json();
         if (json.ok && json.config) {
           const c = json.config;
@@ -527,16 +549,27 @@
           alertThreshold.value = (c.threshold != null) ? c.threshold : 8;
         }
       } catch (e) { /* 忽略，使用默认值 */ }
+      document.getElementById("myLink").value = location.origin + location.pathname + "?u=" + encodeURIComponent(MY_KEY);
       alertModal.classList.add("show");
     });
     alertClose.addEventListener("click", () => alertModal.classList.remove("show"));
     alertModal.addEventListener("click", (e) => { if (e.target === alertModal) alertModal.classList.remove("show"); });
+    document.getElementById("copyLink").addEventListener("click", () => {
+      const inp = document.getElementById("myLink");
+      inp.select();
+      const done = () => { alertMsg.style.color = "#2e7d32"; alertMsg.textContent = "专属链接已复制，发给朋友即可各自独立配置提醒"; };
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(inp.value).then(done).catch(() => { document.execCommand("copy"); done(); });
+      } else {
+        document.execCommand("copy"); done();
+      }
+    });
 
     alertSave.addEventListener("click", async () => {
       alertMsg.style.color = "#2e7d32";
       alertMsg.textContent = "保存中…";
       try {
-        const res = await fetch("/api/alert_config", {
+        const res = await fetch("/api/alert_config?u=" + encodeURIComponent(MY_KEY), {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({

@@ -422,38 +422,61 @@ def get_fund_premium():
 # 溢价套利提醒：当「开放申购」的 LOF 溢价率超过阈值时，推送到 微信/钉钉/飞书。
 # 配置保存在 alert_config.json（也可通过网页「提醒设置」弹窗修改）。
 # ---------------------------------------------------------------------------
-ALERT_CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "alert_config.json")
+ALERT_CONFIGS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "alert_configs.json")
 _ALERT_COOLDOWN = 30 * 60  # 同一只基金两次推送的最小间隔（秒），避免刷屏
-_last_alert = {}            # {基金代码: 上次推送时间戳}
+_last_alert = {}            # {用户key: {基金代码: 上次推送时间戳}}，按用户独立冷却
 
 
 def _default_alert_config():
     return {"enabled": False, "platform": "dingtalk", "webhook": "", "threshold": 8.0}
 
 
-def load_alert_config():
+def load_alert_configs():
+    """加载全部用户的提醒配置：{user_key: {enabled, platform, webhook, threshold}}。"""
     try:
-        if os.path.exists(ALERT_CONFIG_PATH):
-            with open(ALERT_CONFIG_PATH, "r", encoding="utf-8") as f:
-                cfg = json.load(f)
-            d = _default_alert_config()
-            d.update(cfg)
-            return d
+        if os.path.exists(ALERT_CONFIGS_PATH):
+            with open(ALERT_CONFIGS_PATH, "r", encoding="utf-8") as f:
+                cfgs = json.load(f)
+            if isinstance(cfgs, dict):
+                # 补齐缺失字段，避免旧配置/手写配置缺字段导致报错
+                return {k: {**_default_alert_config(), **(v or {})} for k, v in cfgs.items()}
     except Exception:
         traceback.print_exc()
-    return _default_alert_config()
+    return {}
 
 
-def save_alert_config(cfg):
+def save_alert_configs(cfgs):
     try:
-        with open(ALERT_CONFIG_PATH, "w", encoding="utf-8") as f:
-            json.dump(cfg, f, ensure_ascii=False, indent=2)
+        with open(ALERT_CONFIGS_PATH, "w", encoding="utf-8") as f:
+            json.dump(cfgs, f, ensure_ascii=False, indent=2)
     except Exception:
         traceback.print_exc()
 
 
-_ALERT_CFG = load_alert_config()
-_ALERT_CFG_LOCK = threading.Lock()
+_ALERT_CONFIGS = load_alert_configs()
+_ALERT_CONFIGS_LOCK = threading.Lock()
+
+
+def get_user_alert(key):
+    """返回某用户的提醒配置；用户不存在时创建默认配置并落盘。匿名(key 为空)返回默认不落盘。"""
+    if not key:
+        return _default_alert_config()
+    with _ALERT_CONFIGS_LOCK:
+        cfg = _ALERT_CONFIGS.get(key)
+        if cfg is None:
+            cfg = _default_alert_config()
+            _ALERT_CONFIGS[key] = cfg
+            save_alert_configs(_ALERT_CONFIGS)
+        return cfg
+
+
+def set_user_alert(key, cfg):
+    """保存某用户的提醒配置（匿名 key 不保存）。"""
+    if not key:
+        return
+    with _ALERT_CONFIGS_LOCK:
+        _ALERT_CONFIGS[key] = cfg
+        save_alert_configs(_ALERT_CONFIGS)
 
 
 def send_webhook(platform, url, text):
@@ -474,10 +497,8 @@ def send_webhook(platform, url, text):
         return False
 
 
-def check_and_alert():
-    """扫描「开放申购」且溢价率超阈值的 LOF，推送提醒（带冷却去重）。"""
-    global _ALERT_CFG, _last_alert
-    cfg = _ALERT_CFG
+def _alert_one(key, cfg):
+    """对单个用户的配置做提醒检测与推送（带按用户独立的冷却去重）。"""
     if not cfg.get("enabled") or not cfg.get("webhook"):
         return
     if not is_trade_time():
@@ -493,6 +514,7 @@ def check_and_alert():
     except (TypeError, ValueError):
         threshold = 8.0
     now = time.time()
+    user_last = _last_alert.setdefault(key, {})
     hits = []
     for d in data:
         if d.get("type") != "LOF":
@@ -503,9 +525,9 @@ def check_and_alert():
         prem = d.get("premium")
         if prem is None or prem <= threshold:
             continue
-        if now - _last_alert.get(d["code"], 0) < _ALERT_COOLDOWN:
+        if now - user_last.get(d["code"], 0) < _ALERT_COOLDOWN:
             continue
-        _last_alert[d["code"]] = now
+        user_last[d["code"]] = now
         hits.append(d)
     if not hits:
         return
@@ -519,7 +541,21 @@ def check_and_alert():
     lines.append("时间：%s" % beijing_now().strftime("%Y-%m-%d %H:%M:%S"))
     text = "\n".join(lines)
     ok = send_webhook(cfg.get("platform", "dingtalk"), cfg.get("webhook", ""), text)
-    print("[提醒] 已推送 %d 只基金，结果=%s" % (len(hits), ok))
+    print("[提醒] 用户 %s 已推送 %d 只基金，结果=%s" % (key, len(hits), ok))
+
+
+def check_and_alert(key=None):
+    """扫描提醒。key 为空时遍历所有用户各自推送；指定 key 时只检查该用户（保存后立即验证用）。"""
+    if key:
+        _alert_one(key, get_user_alert(key))
+        return
+    with _ALERT_CONFIGS_LOCK:
+        items = list(_ALERT_CONFIGS.items())
+    for k, cfg in items:
+        try:
+            _alert_one(k, cfg)
+        except Exception:
+            traceback.print_exc()
 
 
 def _alert_scheduler():
@@ -593,28 +629,29 @@ def api_subscribe():
 
 @app.route("/api/alert_config", methods=["GET"])
 def api_alert_config_get():
-    """返回当前提醒配置。"""
-    return jsonify({"ok": True, "config": dict(_ALERT_CFG)})
+    """返回指定用户的提醒配置（u 参数为用户 key）。"""
+    key = request.args.get("u") or ""
+    return jsonify({"ok": True, "config": get_user_alert(key)})
 
 
 @app.route("/api/alert_config", methods=["POST"])
 def api_alert_config_post():
-    """保存提醒配置（启用/平台/Webhook/阈值），并立即检测一次。"""
-    global _ALERT_CFG
+    """保存指定用户的提醒配置（u 参数为用户 key），并立即检测一次。"""
+    key = request.args.get("u") or ""
     try:
         body = request.get_json(force=True, silent=True) or {}
-        with _ALERT_CFG_LOCK:
-            _ALERT_CFG["enabled"] = bool(body.get("enabled", _ALERT_CFG.get("enabled", False)))
-            _ALERT_CFG["platform"] = body.get("platform", _ALERT_CFG.get("platform", "dingtalk"))
-            _ALERT_CFG["webhook"] = (body.get("webhook") or "").strip()
-            try:
-                _ALERT_CFG["threshold"] = float(body.get("threshold", _ALERT_CFG.get("threshold", 8)))
-            except (TypeError, ValueError):
-                pass
-            save_alert_config(_ALERT_CFG)
+        cfg = get_user_alert(key)
+        cfg["enabled"] = bool(body.get("enabled", cfg.get("enabled", False)))
+        cfg["platform"] = body.get("platform", cfg.get("platform", "dingtalk"))
+        cfg["webhook"] = (body.get("webhook") or "").strip()
+        try:
+            cfg["threshold"] = float(body.get("threshold", cfg.get("threshold", 8)))
+        except (TypeError, ValueError):
+            pass
+        set_user_alert(key, cfg)
         # 保存后立即检测一次（便于验证 Webhook 是否可用）
-        threading.Thread(target=check_and_alert, daemon=True).start()
-        return jsonify({"ok": True, "config": dict(_ALERT_CFG)})
+        threading.Thread(target=check_and_alert, args=(key,), daemon=True).start()
+        return jsonify({"ok": True, "config": cfg})
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)})
 
