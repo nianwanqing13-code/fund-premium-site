@@ -620,13 +620,13 @@
       alertMsg.style.color = "#2e7d32";
       alertMsg.textContent = "保存中…";
       try {
+        const targets = [...document.querySelectorAll("#alertTargets .target-row")].map(row => ({
+          platform: row.querySelector(".t-platform").value,
+          webhook: row.querySelector(".t-webhook").value.trim(),
+        })).filter(t => t.webhook);
         const res = await fetch("/api/alert_config?u=" + encodeURIComponent(MY_KEY) + "&owner=" + encodeURIComponent(MY_OWNER), {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          const targets = [...document.querySelectorAll("#alertTargets .target-row")].map(row => ({
-            platform: row.querySelector(".t-platform").value,
-            webhook: row.querySelector(".t-webhook").value.trim(),
-          })).filter(t => t.webhook);
           body: JSON.stringify({
             enabled: alertEnabled.checked,
             threshold: parseFloat(alertThreshold.value) || 8,
