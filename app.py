@@ -793,6 +793,22 @@ def api_alert_config_get():
     })
 
 
+@app.route("/api/db_status")
+def api_db_status():
+    """查看配置持久化状态：DB 是否已配置、是否可连通（便于排查重启丢配置问题）。"""
+    reachable = False
+    if _DATABASE_URL:
+        conn = _db_conn()
+        reachable = conn is not None
+        if conn:
+            conn.close()
+    return jsonify({
+        "db_configured": bool(_DATABASE_URL),
+        "db_reachable": reachable,
+        "fallback": "json_file" if not _DATABASE_URL else "postgres",
+    })
+
+
 @app.route("/api/alert_config", methods=["POST"])
 def api_alert_config_post():
     """保存指定链接下「当前成员(owner)」自己的配置，只更新该成员，不影响其他成员（合并而非覆盖）。"""
