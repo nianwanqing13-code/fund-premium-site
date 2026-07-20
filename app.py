@@ -372,70 +372,59 @@ def _fetch_one(fund_type, fetch_func):
         if df is None or df.empty:
             return records
 
-        if fund_type == "LOF":
-            # LOF 没有交易所实时 IOPV，改用基金速查网(dayfund)的盘中实时估值。
-            # 先收集所有 LOF 代码与市价，再用线程池并发查询 dayfund（控制并发与超时），
-            # 避免上千只逐只串行请求过慢。
-            codes, prices, names, chg = [], [], [], []
-            for _, row in df.iterrows():
-                code = str(row.get("代码", "")).strip()
-                price = _to_float(row.get("最新价"))
-                if not code or price is None:
-                    continue
-                codes.append(code)
-                prices.append(price)
-                names.append(str(row.get("名称", "")).strip())
-                chg.append(_to_float(row.get("涨跌幅")))
-
-            # 并发查询 dayfund 估值：code -> est_val
-            est_map = {}
-            with ThreadPoolExecutor(max_workers=16) as ex:
-                fut = {ex.submit(fetch_dayfund_estimate, c): c for c in codes}
-                for f in fut:
-                    c = fut[f]
-                    try:
-                        est, _nav = f.result()
-                        if est:
-                            est_map[c] = est
-                    except Exception:
-                        pass
-
-            for code, price, name, c in zip(codes, prices, names, chg):
-                est = est_map.get(code)
-                if est is None or est <= 0:
-                    continue
-                iopv_val = est
-                premium = (price - iopv_val) / iopv_val * 100.0
-                records.append(
-                    {
-                        "code": code,
-                        "name": name,
-                        "type": fund_type,
-                        "price": round(price, 4),
-                        "iopv": round(iopv_val, 4),
-                        "premium": round(premium, 3),
-                        "change_pct": c,
-                    }
-                )
-            return records
-
-        # ETF：使用交易所实时 IOPV(f441)
+        # 先收集所有基金代码、市价、名称、涨跌幅，以及 ETF 的东方财富 IOPV
+        codes, prices, names, chgs, em_iopv = [], [], [], [], []
         for _, row in df.iterrows():
+            code = str(row.get("代码", "")).strip()
             price = _to_float(row.get("最新价"))
-            iopv = _to_float(row.get("IOPV实时估值"))
-            if price is None or iopv is None or iopv <= 0:
+            if not code or price is None:
                 continue
-            premium = (price - iopv) / iopv * 100.0
+            codes.append(code)
+            prices.append(price)
+            names.append(str(row.get("名称", "")).strip())
+            chgs.append(_to_float(row.get("涨跌幅")))
+            em_iopv.append(_to_float(row.get("IOPV实时估值")) if fund_type != "LOF" else None)
+
+        # 并发查询 dayfund：code -> (est_val 盘中实时估值, nav_val 昨日单位净值)
+        est_map, nav_map = {}, {}
+        with ThreadPoolExecutor(max_workers=16) as ex:
+            fut = {ex.submit(fetch_dayfund_estimate, c): c for c in codes}
+            for f in fut:
+                c = fut[f]
+                try:
+                    est, nav = f.result()
+                    if est:
+                        est_map[c] = est
+                    if nav:
+                        nav_map[c] = nav
+                except Exception:
+                    pass
+
+        for code, price, name, chg, ei in zip(codes, prices, names, chgs, em_iopv):
+            if fund_type == "LOF":
+                # LOF 没有交易所实时 IOPV，改用 dayfund 的盘中实时估值
+                iopv_val = est_map.get(code)
+                if iopv_val is None or iopv_val <= 0:
+                    continue
+            else:
+                # ETF 使用交易所实时 IOPV(f441)
+                iopv_val = ei
+                if iopv_val is None or iopv_val <= 0:
+                    continue
+            premium = (price - iopv_val) / iopv_val * 100.0
+            nav_val = nav_map.get(code)
             records.append(
                 {
-                    "code": str(row.get("代码", "")).strip(),
-                    "name": str(row.get("名称", "")).strip(),
+                    "code": code,
+                    "name": name,
                     "type": fund_type,
                     "price": round(price, 4),          # 当日市价
-                    "iopv": round(iopv, 4),            # 预估净值(ETF 实时 IOPV)
+                    "iopv": round(iopv_val, 4),        # 预估净值(ETF 实时 IOPV / LOF dayfund 实时估值)
+                    "nav": round(nav_val, 4) if nav_val is not None else None,  # 昨日单位净值
                     "premium": round(premium, 3),      # 溢价率(%)
-                    "change_pct": _to_float(row.get("涨跌幅")),  # 当日涨跌幅(%)
+                    "change_pct": chg,                 # 当日涨跌幅(%)
                 }
+
             )
     except Exception:
         # 打印错误方便排查，但不影响其它类型基金

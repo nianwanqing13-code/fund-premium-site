@@ -217,12 +217,12 @@
     <table>
       <thead>
         <tr>
-          <th data-key="code">代码</th>
-          <th data-key="name">名称</th>
-          <th data-key="type">类型</th>
-          <th data-key="price">当日市价</th>
-          <th data-key="iopv">预估净值</th>
-          <th data-key="change_pct">涨跌幅%</th>
+        <th data-key="code">代码</th>
+        <th data-key="name">名称</th>
+        <th data-key="price">当日市价</th>
+        <th data-key="iopv">预估净值</th>
+        <th data-key="nav">昨日净值</th>
+        <th data-key="change_pct">涨跌幅%</th>
           <th data-key="premium">溢价率% <span class="arrow">▼</span></th>
           <th data-key="subscribe">申购状态</th>
           <th data-key="subscribe_amount">可申购数额</th>
@@ -430,9 +430,9 @@
         return `<tr class="${rowCls}">
           <td class="code" data-label="代码">${d.code}</td>
           <td data-label="名称">${d.name}${badge}</td>
-          <td data-label="类型"><span class="tag tag-${d.type}">${d.type}</span></td>
           <td data-label="市价">${fmt(d.price, 3)}</td>
           <td data-label="净值">${fmt(d.iopv, 3)}</td>
+          <td data-label="昨日净值">${d.nav === null || d.nav === undefined ? "-" : fmt(d.nav, 3)}</td>
           <td data-label="涨跌幅" class="${cCls}">${d.change_pct === null ? "-" : csign + fmt(d.change_pct, 2)}</td>
           <td data-label="溢价率" class="${pCls}">${sign}${fmt(d.premium, 3)}</td>
           ${subHtml}
