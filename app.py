@@ -46,6 +46,16 @@ _LOF_TIMEOUT = 12
 
 app = Flask(__name__)
 
+
+# 禁止浏览器/CDN 缓存任何响应（尤其是首页 HTML），
+# 避免用户一直拿到旧版前端（旧版无超时重试，fetch 卡死就永远“加载中”）。
+@app.after_request
+def _no_cache(resp):
+    resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+    resp.headers["Pragma"] = "no-cache"
+    resp.headers["Expires"] = "0"
+    return resp
+
 # ---------------------------------------------------------------------------
 # 简单的内存缓存：避免频繁请求数据源被限制，默认缓存 60 秒
 # ---------------------------------------------------------------------------
