@@ -372,8 +372,10 @@ def _fetch_one(fund_type, fetch_func):
         if df is None or df.empty:
             return records
 
-        # 先收集所有基金代码、市价、名称、涨跌幅，以及 ETF 的东方财富 IOPV
-        codes, prices, names, chgs, em_iopv = [], [], [], [], []
+        # 先收集所有基金代码、市价、名称、涨跌幅；
+        # LOF 额外收集东方财富「折价率」(f402)，ETF 收集东方财富「实时 IOPV」(f441)。
+        # 这两项是东方财富自带、稳定可用的，作为 dayfund 接口失败时的回退依据。
+        codes, prices, names, chgs, em_iopv, discs = [], [], [], [], [], []
         for _, row in df.iterrows():
             code = str(row.get("代码", "")).strip()
             price = _to_float(row.get("最新价"))
@@ -384,47 +386,76 @@ def _fetch_one(fund_type, fetch_func):
             names.append(str(row.get("名称", "")).strip())
             chgs.append(_to_float(row.get("涨跌幅")))
             em_iopv.append(_to_float(row.get("IOPV实时估值")) if fund_type != "LOF" else None)
+            discs.append(_to_float(row.get("折价率")) if fund_type == "LOF" else None)
 
-        # 并发查询 dayfund：code -> (est_val 盘中实时估值, nav_val 昨日单位净值)
+        # 并发查询 dayfund（增强项，线上可能被限频/封锁）：code -> (est 盘中实时估值, nav 昨日单位净值)
+        # 优化：dayfund 对同一服务器出口 IP 通常「全通或全不通」，先快速探测 1 只；
+        # 若失败则直接跳过整批 dayfund 查询（仅多花 1 次短超时），避免上千只逐只超时拖垮刷新。
         est_map, nav_map = {}, {}
-        with ThreadPoolExecutor(max_workers=16) as ex:
-            fut = {ex.submit(fetch_dayfund_estimate, c): c for c in codes}
-            for f in fut:
-                c = fut[f]
-                try:
-                    est, nav = f.result()
-                    if est:
-                        est_map[c] = est
-                    if nav:
-                        nav_map[c] = nav
-                except Exception:
-                    pass
+        if codes:
+            _pcode = codes[0]
+            _pe = fetch_dayfund_estimate(_pcode, timeout=3)
+            if _pe[0] or _pe[1]:
+                if _pe[0]:
+                    est_map[_pcode] = _pe[0]
+                if _pe[1]:
+                    nav_map[_pcode] = _pe[1]
+                with ThreadPoolExecutor(max_workers=16) as ex:
+                    fut = {ex.submit(fetch_dayfund_estimate, c): c for c in codes[1:]}
+                    for f in fut:
+                        c = fut[f]
+                        try:
+                            est, nav = f.result()
+                            if est:
+                                est_map[c] = est
+                            if nav:
+                                nav_map[c] = nav
+                        except Exception:
+                            pass
+            else:
+                print("[提示] dayfund 接口本次不可用（探测失败），LOF/净值回退到东方财富数据。")
 
-        for code, price, name, chg, ei in zip(codes, prices, names, chgs, em_iopv):
+        for code, price, name, chg, ei, disc in zip(codes, prices, names, chgs, em_iopv, discs):
             if fund_type == "LOF":
-                # LOF 没有交易所实时 IOPV，改用 dayfund 的盘中实时估值
+                # LOF 没有交易所实时 IOPV：优先用 dayfund 盘中实时估值；
+                # dayfund 失败时用「折价率」反推昨日单位净值作为预估净值兜底，保证 LOF 不整批丢失。
                 iopv_val = est_map.get(code)
+                if not (iopv_val and iopv_val > 0) and disc is not None:
+                    denom = 1.0 - disc / 100.0
+                    if denom != 0:
+                        iopv_val = price / denom
                 if iopv_val is None or iopv_val <= 0:
                     continue
+                # 昨日净值：dayfund 优先；否则同样用折价率反推（折价率本就基于昨日净值）
+                nav_val = nav_map.get(code)
+                if nav_val is None and disc is not None:
+                    denom = 1.0 - disc / 100.0
+                    if denom != 0:
+                        nav_val = price / denom
             else:
                 # ETF 使用交易所实时 IOPV(f441)
                 iopv_val = ei
                 if iopv_val is None or iopv_val <= 0:
                     continue
+                # 昨日净值：dayfund 优先；失败时用「昨收价」近似（ETF 市价紧贴净值，近似足够）
+                nav_val = nav_map.get(code)
+                if nav_val is None and chg is not None:
+                    denom = 1.0 + chg / 100.0
+                    if denom != 0:
+                        nav_val = price / denom
+
             premium = (price - iopv_val) / iopv_val * 100.0
-            nav_val = nav_map.get(code)
             records.append(
                 {
                     "code": code,
                     "name": name,
                     "type": fund_type,
                     "price": round(price, 4),          # 当日市价
-                    "iopv": round(iopv_val, 4),        # 预估净值(ETF 实时 IOPV / LOF dayfund 实时估值)
+                    "iopv": round(iopv_val, 4),        # 预估净值(ETF 实时 IOPV / LOF dayfund 或折价率反推)
                     "nav": round(nav_val, 4) if nav_val is not None else None,  # 昨日单位净值
                     "premium": round(premium, 3),      # 溢价率(%)
                     "change_pct": chg,                 # 当日涨跌幅(%)
                 }
-
             )
     except Exception:
         # 打印错误方便排查，但不影响其它类型基金
