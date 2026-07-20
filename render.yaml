@@ -1,9 +1,3 @@
-databases:
-  - name: fund-premium-db
-    databaseName: fund_premium
-    user: fund_premium_user
-    plan: free
-
 services:
   - type: web
     name: fund-premium-site
@@ -15,7 +9,8 @@ services:
     envVars:
       - key: PYTHON_VERSION
         value: "3.11"
+      # 持久化：在 Render 后台手动创建 Postgres 数据库后，
+      # 把它的 Internal Database URL 作为 DATABASE_URL 环境变量填到这里（或直接在后台 Environment 添加）。
+      # 不填则自动回退到本地 JSON 文件（重启会丢配置）。
       - key: DATABASE_URL
-        fromDatabase:
-          name: fund-premium-db
-          property: connectionString
+        value: ""
