@@ -476,12 +476,19 @@
       }
     }
 
-    // 加载数据
-    async function load(refresh = false) {
-      statusEl.textContent = "加载中…";
+    // 加载数据（带超时 + 自动重试，应对 Render 免费版冷启动/慢网络）
+    async function load(refresh = false, retry = 0) {
+      if (retry === 0) {
+        statusEl.textContent = "加载中…（首次访问稍慢，请稍候）";
+      } else {
+        statusEl.textContent = `加载失败，正在第 ${retry} 次重试…`;
+      }
       try {
         const url = (refresh ? "/api/refresh" : "/api/premium") + "?u=" + encodeURIComponent(MY_KEY);
-        const res = await fetch(url);
+        const ctrl = new AbortController();
+        const timer = setTimeout(() => ctrl.abort(), 30000);  // 30 秒超时
+        const res = await fetch(url, { signal: ctrl.signal });
+        clearTimeout(timer);
         const json = await res.json();
         if (!json.ok) {
           statusEl.textContent = "出错：" + (json.error || "未知错误");
@@ -504,7 +511,13 @@
         render();
         loadSubscribe();   // 主数据就绪后再异步拉申购状态
       } catch (e) {
-        statusEl.textContent = "网络错误：" + e.message;
+        // 超时或网络错误：自动重试（最多 3 次）
+        if (retry < 3) {
+          statusEl.textContent = `加载失败，${3 - retry} 秒后重试…`;
+          setTimeout(() => load(refresh, retry + 1), 3000);
+        } else {
+          statusEl.textContent = "网络错误：" + e.message + "（可尝试刷新页面 Ctrl+F5）";
+        }
       }
     }
 
