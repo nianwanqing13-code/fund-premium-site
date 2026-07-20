@@ -241,17 +241,13 @@
         <h3>溢价套利提醒设置</h3>
         <p class="modal-tip">当「开放申购」的 LOF 溢价率超过阈值时，自动推送到你的微信/钉钉/飞书（仅交易时段推送，避免隔夜误报）。</p>
         <label class="row check"><input type="checkbox" id="alertEnabled" /> 启用提醒</label>
-        <label class="row">平台
-          <select id="alertPlatform">
-            <option value="dingtalk">钉钉</option>
-            <option value="feishu">飞书</option>
-            <option value="wecom">企业微信</option>
-            <option value="serverchan">Server酱（微信）</option>
-          </select>
-        </label>
-        <label class="row">Webhook 地址
-          <input id="alertWebhook" type="text" placeholder="粘贴机器人 Webhook 地址" />
-        </label>
+        <div class="row">
+          <div style="display:flex;justify-content:space-between;align-items:center;">
+            <span>提醒目标（可添加多个：飞书 / 企业微信 / 微信 等）</span>
+          </div>
+          <div id="alertTargets"></div>
+          <button class="btn btn-ghost" id="addTarget" type="button" style="padding:6px 12px;margin-top:6px;">+ 添加提醒目标</button>
+        </div>
         <label class="row">溢价率阈值 %
           <input id="alertThreshold" type="number" value="8" step="0.5" />
         </label>
@@ -532,9 +528,38 @@
     const alertSave = document.getElementById("alertSave");
     const alertMsg = document.getElementById("alertMsg");
     const alertEnabled = document.getElementById("alertEnabled");
-    const alertPlatform = document.getElementById("alertPlatform");
-    const alertWebhook = document.getElementById("alertWebhook");
     const alertThreshold = document.getElementById("alertThreshold");
+
+    // ---- 多提醒目标：一个链接可同时推飞书/企业微信/微信等 ----
+    const PLATFORM_OPTS = `
+      <option value="dingtalk">钉钉</option>
+      <option value="feishu">飞书</option>
+      <option value="wecom">企业微信</option>
+      <option value="serverchan">Server酱（微信）</option>
+    `;
+    function addTargetRow(platform, webhook) {
+      const row = document.createElement("div");
+      row.className = "target-row";
+      row.style.cssText = "display:flex;gap:6px;margin-top:6px;align-items:center;";
+      row.innerHTML =
+        '<select class="t-platform" style="padding:8px 10px;border:1px solid #ccc;border-radius:8px;font-size:14px;">' + PLATFORM_OPTS + '</select>' +
+        '<input class="t-webhook" type="text" placeholder="机器人 Webhook 地址" style="flex:1;padding:8px 10px;border:1px solid #ccc;border-radius:8px;font-size:14px;" />' +
+        '<button class="btn btn-ghost t-del" type="button" style="padding:8px 10px;">×</button>';
+      row.querySelector(".t-platform").value = platform || "feishu";
+      row.querySelector(".t-webhook").value = webhook || "";
+      row.querySelector(".t-del").addEventListener("click", () => row.remove());
+      document.getElementById("alertTargets").appendChild(row);
+    }
+    function renderTargets(targets) {
+      const box = document.getElementById("alertTargets");
+      box.innerHTML = "";
+      if (targets && targets.length) {
+        targets.forEach(t => addTargetRow(t.platform, t.webhook));
+      } else {
+        addTargetRow("feishu", "");   // 默认给一行，方便上手
+      }
+    }
+    document.getElementById("addTarget").addEventListener("click", () => addTargetRow("feishu", ""));
 
     alertBtn.addEventListener("click", async () => {
       alertMsg.textContent = "";
@@ -544,9 +569,10 @@
         if (json.ok && json.config) {
           const c = json.config;
           alertEnabled.checked = !!c.enabled;
-          alertPlatform.value = c.platform || "dingtalk";
-          alertWebhook.value = c.webhook || "";
           alertThreshold.value = (c.threshold != null) ? c.threshold : 8;
+          renderTargets(c.targets);
+        } else {
+          renderTargets([]);
         }
       } catch (e) { /* 忽略，使用默认值 */ }
       document.getElementById("myLink").value = location.origin + location.pathname + "?u=" + encodeURIComponent(MY_KEY);
@@ -572,11 +598,14 @@
         const res = await fetch("/api/alert_config?u=" + encodeURIComponent(MY_KEY), {
           method: "POST",
           headers: { "Content-Type": "application/json" },
+          const targets = [...document.querySelectorAll("#alertTargets .target-row")].map(row => ({
+            platform: row.querySelector(".t-platform").value,
+            webhook: row.querySelector(".t-webhook").value.trim(),
+          })).filter(t => t.webhook);
           body: JSON.stringify({
             enabled: alertEnabled.checked,
-            platform: alertPlatform.value,
-            webhook: alertWebhook.value.trim(),
             threshold: parseFloat(alertThreshold.value) || 8,
+            targets: targets,
           }),
         });
         const json = await res.json();

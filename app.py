@@ -428,18 +428,42 @@ _last_alert = {}            # {用户key: {基金代码: 上次推送时间戳}}
 
 
 def _default_alert_config():
-    return {"enabled": False, "platform": "dingtalk", "webhook": "", "threshold": 8.0}
+    return {"enabled": False, "threshold": 8.0, "targets": []}
+
+
+def _migrate_cfg(v):
+    """把任意格式（含旧版单 platform/webhook）归一化为 {enabled, threshold, targets:[{platform,webhook}]}。"""
+    d = _default_alert_config()
+    if not isinstance(v, dict):
+        return d
+    d["enabled"] = bool(v.get("enabled", False))
+    try:
+        d["threshold"] = float(v.get("threshold", 8))
+    except (TypeError, ValueError):
+        d["threshold"] = 8.0
+    targets = []
+    raw = v.get("targets")
+    if isinstance(raw, list):                       # 新格式：targets 列表
+        for t in raw:
+            if isinstance(t, dict) and t.get("webhook"):
+                targets.append({"platform": t.get("platform", "dingtalk"),
+                                "webhook": str(t["webhook"]).strip()})
+    elif v.get("webhook"):                          # 旧格式：单 platform+webhook，迁移成单目标
+        targets.append({"platform": v.get("platform", "dingtalk"),
+                        "webhook": str(v["webhook"]).strip()})
+    d["targets"] = targets
+    return d
 
 
 def load_alert_configs():
-    """加载全部用户的提醒配置：{user_key: {enabled, platform, webhook, threshold}}。"""
+    """加载全部用户的提醒配置：{user_key: {enabled, threshold, targets:[...]}}。"""
     try:
         if os.path.exists(ALERT_CONFIGS_PATH):
             with open(ALERT_CONFIGS_PATH, "r", encoding="utf-8") as f:
                 cfgs = json.load(f)
             if isinstance(cfgs, dict):
-                # 补齐缺失字段，避免旧配置/手写配置缺字段导致报错
-                return {k: {**_default_alert_config(), **(v or {})} for k, v in cfgs.items()}
+                # 归一化（兼容旧版单平台配置 + 补齐缺失字段）
+                return {k: _migrate_cfg(val) for k, val in cfgs.items()}
     except Exception:
         traceback.print_exc()
     return {}
@@ -498,8 +522,8 @@ def send_webhook(platform, url, text):
 
 
 def _alert_one(key, cfg):
-    """对单个用户的配置做提醒检测与推送（带按用户独立的冷却去重）。"""
-    if not cfg.get("enabled") or not cfg.get("webhook"):
+    """对单个用户的配置做提醒检测与推送（遍历所有 targets，带按用户独立的冷却去重）。"""
+    if not cfg.get("enabled") or not cfg.get("targets"):
         return
     if not is_trade_time():
         return  # 仅在交易时段提醒，避免用隔夜陈旧数据误报
@@ -540,8 +564,9 @@ def _alert_one(key, cfg):
                         ("限额 " + amt if amt else "额度充足")))
     lines.append("时间：%s" % beijing_now().strftime("%Y-%m-%d %H:%M:%S"))
     text = "\n".join(lines)
-    ok = send_webhook(cfg.get("platform", "dingtalk"), cfg.get("webhook", ""), text)
-    print("[提醒] 用户 %s 已推送 %d 只基金，结果=%s" % (key, len(hits), ok))
+    for t in cfg["targets"]:
+        ok = send_webhook(t.get("platform", "dingtalk"), t.get("webhook", ""), text)
+        print("[提醒] 用户 %s 推送到 %s，结果=%s" % (key, t.get("platform"), ok))
 
 
 def check_and_alert(key=None):
@@ -642,12 +667,19 @@ def api_alert_config_post():
         body = request.get_json(force=True, silent=True) or {}
         cfg = get_user_alert(key)
         cfg["enabled"] = bool(body.get("enabled", cfg.get("enabled", False)))
-        cfg["platform"] = body.get("platform", cfg.get("platform", "dingtalk"))
-        cfg["webhook"] = (body.get("webhook") or "").strip()
         try:
             cfg["threshold"] = float(body.get("threshold", cfg.get("threshold", 8)))
         except (TypeError, ValueError):
             pass
+        # 多目标：从前端 targets 列表收集（过滤掉 webhook 为空的行）
+        targets = []
+        for t in (body.get("targets") or []):
+            if isinstance(t, dict) and t.get("webhook"):
+                targets.append({
+                    "platform": t.get("platform", "dingtalk"),
+                    "webhook": str(t["webhook"]).strip(),
+                })
+        cfg["targets"] = targets
         set_user_alert(key, cfg)
         # 保存后立即检测一次（便于验证 Webhook 是否可用）
         threading.Thread(target=check_and_alert, args=(key,), daemon=True).start()
