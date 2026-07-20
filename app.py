@@ -52,6 +52,7 @@ app = Flask(__name__)
 _CACHE = {"data": None, "time": 0}
 _CACHE_SECONDS = 60
 _fetch_lock = threading.Lock()   # 防止并发请求各自触发一次完整抓取
+_REFRESHING = False              # 后台刷新标志，避免并发重复触发抓取
 
 
 # 北京时间（UTC+8）。Render 等云平台容器默认时区为 UTC，
@@ -246,9 +247,11 @@ def _fetch_eastmoney_clist(fs, fields, page_size=1000):
     }
     all_diff = []
     last_err = None
-    for attempt in range(4):
+    # 重试次数与时长都做了上限：单页抓取最坏约 2×12s=24s，
+    # 配合“后台刷新”机制，避免抓取卡死导致请求/网关超时“无响应”。
+    for attempt in range(2):
         try:
-            r = requests.get(url, params=base, headers=_LOF_HEADERS, timeout=15)
+            r = requests.get(url, params=base, headers=_LOF_HEADERS, timeout=12)
             r.raise_for_status()
             data = r.json().get("data") or {}
             total = data.get("total") or 0
@@ -264,7 +267,7 @@ def _fetch_eastmoney_clist(fs, fields, page_size=1000):
             for pn in range(2, pages + 1):
                 p = dict(base)
                 p["pn"] = str(pn)
-                rr = requests.get(url, params=p, headers=_LOF_HEADERS, timeout=15)
+                rr = requests.get(url, params=p, headers=_LOF_HEADERS, timeout=12)
                 d2 = (rr.json().get("data") or {}).get("diff") or []
                 all_diff.extend(d2)
                 time.sleep(0.1)
@@ -361,36 +364,58 @@ def _fetch_one(fund_type, fetch_func):
     return records
 
 
+def _fetch_all_records():
+    """抓取全部场内基金（ETF+LOF）实时行情并整理成统一格式（阻塞，可能较慢）。"""
+    all_records = []
+    # ETF 与 LOF 并行获取（均为自行请求 push2delay，单页拉取，约数秒完成）
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        f_etf = pool.submit(_fetch_one, "ETF", fetch_etf_list)
+        f_lof = pool.submit(_fetch_one, "LOF", fetch_lof_list)
+        all_records += f_etf.result()
+        all_records += f_lof.result()
+    # 默认按溢价率从高到低排序
+    all_records.sort(key=lambda x: x["premium"], reverse=True)
+    return all_records
+
+
+def _background_refresh():
+    """后台刷新缓存，绝不阻塞请求线程。
+
+    用 _fetch_lock 串行化抓取；用 _REFRESHING 标志避免并发重复触发。
+    """
+    global _CACHE, _REFRESHING
+    if _REFRESHING:
+        return
+    _REFRESHING = True
+    try:
+        with _fetch_lock:
+            all_records = _fetch_all_records()
+            _CACHE["data"] = all_records
+            _CACHE["time"] = time.time()
+        # 后台提醒（不阻塞）
+        threading.Thread(target=check_and_alert, daemon=True).start()
+    except Exception:
+        traceback.print_exc()
+    finally:
+        _REFRESHING = False
+
+
 def get_fund_premium():
-    """获取全部场内基金的溢价率数据（带缓存）。"""
+    """获取全部场内基金的溢价率数据（带缓存，永不因抓取超时卡死请求）。
+
+    行为：
+    - 缓存新鲜：直接返回。
+    - 缓存过期但仍有旧数据：立即返回旧数据，并在后台静默刷新（用户无感知）。
+    - 完全无缓存（首拉/刚清空）：立即返回现有缓存（可能为空），并在后台抓取；
+      前端每 60 秒自动刷新会自然补齐，避免请求长时间挂起被网关超时“无响应”。
+    """
     global _CACHE
     now = time.time()
-    if _CACHE["data"] is not None and (now - _CACHE["time"] < _CACHE_SECONDS):
-        return _CACHE["data"]
-
-    # 加锁避免并发请求各自触发一次完整抓取（接口较慢，并发会互相拖慢）
-    with _fetch_lock:
-        now = time.time()
-        if _CACHE["data"] is not None and (now - _CACHE["time"] < _CACHE_SECONDS):
-            return _CACHE["data"]
-
-        all_records = []
-
-        # ETF 与 LOF 并行获取（均为自行请求 push2delay，单页拉取，约数秒完成）
-        with ThreadPoolExecutor(max_workers=2) as pool:
-            f_etf = pool.submit(_fetch_one, "ETF", fetch_etf_list)
-            f_lof = pool.submit(_fetch_one, "LOF", fetch_lof_list)
-            all_records += f_etf.result()
-            all_records += f_lof.result()
-
-        # 默认按溢价率从高到低排序
-        all_records.sort(key=lambda x: x["premium"], reverse=True)
-
-        _CACHE["data"] = all_records
-        _CACHE["time"] = now
-        # 后台检查提醒（不阻塞接口响应）
-        threading.Thread(target=check_and_alert, daemon=True).start()
-        return all_records
+    fresh = _CACHE["data"] is not None and (now - _CACHE["time"] < _CACHE_SECONDS)
+    if not fresh:
+        # 触发一次后台刷新（内部有 _REFRESHING 去重，不会重复抓取）
+        threading.Thread(target=_background_refresh, daemon=True).start()
+    return _CACHE["data"] or []
 
 
 # ---------------------------------------------------------------------------
@@ -536,10 +561,25 @@ def api_premium():
 
 @app.route("/api/refresh")
 def api_refresh():
-    """强制清空缓存，重新拉取数据。"""
+    """强制清空缓存，重新拉取数据（后台进行，立即返回，避免请求卡死）。"""
+    old = _CACHE["data"]
     _CACHE["data"] = None
     _CACHE["time"] = 0
-    return api_premium()
+    threading.Thread(target=_background_refresh, daemon=True).start()
+    # 返回清空前的旧数据，保证前端立刻有内容；后台刷新完成后自动刷新会补齐
+    return jsonify(
+        {
+            "ok": True,
+            "count": len(old or []),
+            "update_time": beijing_now().strftime("%Y-%m-%d %H:%M:%S"),
+            "subscribe_info": {
+                "can_subscribe_now": is_trade_time(),
+                "period": "交易日 9:30-11:30、13:00-15:00（法定节假日除外）",
+                "state": "当前可申购" if is_trade_time() else "非交易时间，暂不可申购",
+            },
+            "data": old or [],
+        }
+    )
 
 
 @app.route("/api/subscribe")
@@ -587,10 +627,12 @@ if __name__ == "__main__":
     host = _os.environ.get("HOST", "0.0.0.0")
     is_cloud = bool(_os.environ.get("PORT")) or _os.environ.get("RENDER") is not None
 
-    # 启动前预热数据缓存，避免首个请求因抓取耗时过长而超时
+    # 启动前预热数据缓存：改为后台进行，避免冷启动阶段抓取耗时过长阻塞
+    # app.run()，导致 Render 健康检查/首屏请求超时“无响应”。（接口本身已改为
+    # 缓存优先、后台刷新，冷启动期间请求会立即返回并在数秒~数十秒内自动补齐。）
     try:
-        get_fund_premium()
-        print(" 数据缓存预热完成（ETF/LOF 已就绪）。")
+        threading.Thread(target=_background_refresh, daemon=True).start()
+        print(" 数据缓存后台预热已启动（ETF/LOF 将在数秒~数十秒内就绪）。")
     except Exception:
         traceback.print_exc()
 
