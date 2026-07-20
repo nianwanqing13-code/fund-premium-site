@@ -719,7 +719,10 @@ def api_alert_config_post():
                     "webhook": str(t["webhook"]).strip(),
                 })
         m["targets"] = targets
-        members[owner] = m
+        if m["targets"] or m["enabled"]:
+            members[owner] = m
+        else:
+            members.pop(owner, None)   # 无目标且未启用 => 视为清空该成员
         set_user_alert(key, cfg)
         # 保存后立即检测一次（便于验证 Webhook 是否可用）
         threading.Thread(target=check_and_alert, args=(key,), daemon=True).start()
