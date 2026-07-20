@@ -348,7 +348,9 @@ def _fetch_one(fund_type, fetch_func):
                 if price is None or disc is None:
                     continue
                 premium = -disc
-                iopv_val = None
+                # LOF 无实时 IOPV，用溢价率反推估算净值，让「预估净值」列也有值
+                denom = 1.0 - disc / 100.0
+                iopv_val = price / denom if denom != 0 else None
             else:
                 iopv = _to_float(row.get("IOPV实时估值"))
                 if price is None or iopv is None or iopv <= 0:
@@ -362,7 +364,7 @@ def _fetch_one(fund_type, fetch_func):
                     "name": str(row.get("名称", "")).strip(),
                     "type": fund_type,
                     "price": round(price, 4),          # 当日市价
-                    "iopv": round(iopv_val, 4) if iopv_val is not None else None,  # 预估净值(LOF 无)
+                    "iopv": round(iopv_val, 4) if iopv_val is not None else None,  # 预估净值(ETF 实时 IOPV / LOF 用溢价率反推)
                     "premium": round(premium, 3),      # 溢价率(%)
                     "change_pct": _to_float(row.get("涨跌幅")),  # 当日涨跌幅(%)
                 }
