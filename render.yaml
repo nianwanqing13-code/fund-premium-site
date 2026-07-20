@@ -9,8 +9,7 @@ services:
     envVars:
       - key: PYTHON_VERSION
         value: "3.11"
-      # 持久化：在 Render 后台手动创建 Postgres 数据库后，
-      # 把它的 Internal Database URL 作为 DATABASE_URL 环境变量填到这里（或直接在后台 Environment 添加）。
-      # 不填则自动回退到本地 JSON 文件（重启会丢配置）。
-      - key: DATABASE_URL
-        value: ""
+      # 持久化说明：在 Render 后台手动创建 Postgres 数据库后，
+      # 把它的「Internal Database URL」作为 DATABASE_URL 环境变量加到本服务（Environment 页面），
+      # 然后手动 Redeploy 即可。DATABASE_URL 不要写进本文件，否则会被这里的空值覆盖。
+      # 不设置则自动回退到本地 JSON 文件（免费版重启会丢配置）。
