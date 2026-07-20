@@ -428,30 +428,50 @@ _last_alert = {}            # {用户key: {基金代码: 上次推送时间戳}}
 
 
 def _default_alert_config():
-    return {"enabled": False, "threshold": 8.0, "targets": []}
+    return {"members": {}}
 
 
-def _migrate_cfg(v):
-    """把任意格式（含旧版单 platform/webhook）归一化为 {enabled, threshold, targets:[{platform,webhook}]}。"""
-    d = _default_alert_config()
-    if not isinstance(v, dict):
-        return d
-    d["enabled"] = bool(v.get("enabled", False))
+def _migrate_member(m):
+    """把单个成员（或旧版单平台配置）归一化为 {enabled, threshold, targets:[...]}。无有效目标且未启用则返回 None。"""
+    if not isinstance(m, dict):
+        return None
+    enabled = bool(m.get("enabled", True))
     try:
-        d["threshold"] = float(v.get("threshold", 8))
+        threshold = float(m.get("threshold", 8))
     except (TypeError, ValueError):
-        d["threshold"] = 8.0
+        threshold = 8.0
     targets = []
-    raw = v.get("targets")
+    raw = m.get("targets")
     if isinstance(raw, list):                       # 新格式：targets 列表
         for t in raw:
             if isinstance(t, dict) and t.get("webhook"):
                 targets.append({"platform": t.get("platform", "dingtalk"),
                                 "webhook": str(t["webhook"]).strip()})
-    elif v.get("webhook"):                          # 旧格式：单 platform+webhook，迁移成单目标
-        targets.append({"platform": v.get("platform", "dingtalk"),
-                        "webhook": str(v["webhook"]).strip()})
-    d["targets"] = targets
+    elif m.get("webhook"):                          # 旧格式：单 platform+webhook
+        targets.append({"platform": m.get("platform", "dingtalk"),
+                        "webhook": str(m["webhook"]).strip()})
+    if not targets and not enabled:
+        return None
+    return {"enabled": enabled, "threshold": threshold, "targets": targets}
+
+
+def _migrate_cfg(v):
+    """归一化为 {members: {owner: {enabled, threshold, targets}}}。兼容旧版单平台配置（归到 owner0）。"""
+    d = _default_alert_config()
+    if not isinstance(v, dict):
+        return d
+    members = {}
+    raw_members = v.get("members")
+    if isinstance(raw_members, dict):               # 新格式：members 字典
+        for ok, m in raw_members.items():
+            mem = _migrate_member(m)
+            if mem:
+                members[ok] = mem
+    else:                                           # 旧格式：单平台/单 targets，归到一个默认成员
+        mem = _migrate_member(v)
+        if mem:
+            members["owner0"] = mem
+    d["members"] = members
     return d
 
 
@@ -522,8 +542,9 @@ def send_webhook(platform, url, text):
 
 
 def _alert_one(key, cfg):
-    """对单个用户的配置做提醒检测与推送（遍历所有 targets，带按用户独立的冷却去重）。"""
-    if not cfg.get("enabled") or not cfg.get("targets"):
+    """对单个链接的配置做提醒检测与推送：遍历其下每个成员(owner)，各自按自己的阈值/启用状态推送。"""
+    members = cfg.get("members") or {}
+    if not members:
         return
     if not is_trade_time():
         return  # 仅在交易时段提醒，避免用隔夜陈旧数据误报
@@ -533,40 +554,44 @@ def _alert_one(key, cfg):
     except Exception:
         traceback.print_exc()
         return
-    try:
-        threshold = float(cfg.get("threshold") or 8)
-    except (TypeError, ValueError):
-        threshold = 8.0
     now = time.time()
-    user_last = _last_alert.setdefault(key, {})
-    hits = []
-    for d in data:
-        if d.get("type") != "LOF":
+    key_last = _last_alert.setdefault(key, {})
+    for owner, m in members.items():
+        if not m.get("enabled") or not m.get("targets"):
             continue
-        s = sub.get(d["code"])
-        if not s or s.get("cls") != "sub-open":
+        try:
+            threshold = float(m.get("threshold") or 8)
+        except (TypeError, ValueError):
+            threshold = 8.0
+        user_last = key_last.setdefault(owner, {})
+        hits = []
+        for d in data:
+            if d.get("type") != "LOF":
+                continue
+            s = sub.get(d["code"])
+            if not s or s.get("cls") != "sub-open":
+                continue
+            prem = d.get("premium")
+            if prem is None or prem <= threshold:
+                continue
+            if now - user_last.get(d["code"], 0) < _ALERT_COOLDOWN:
+                continue
+            user_last[d["code"]] = now
+            hits.append(d)
+        if not hits:
             continue
-        prem = d.get("premium")
-        if prem is None or prem <= threshold:
-            continue
-        if now - user_last.get(d["code"], 0) < _ALERT_COOLDOWN:
-            continue
-        user_last[d["code"]] = now
-        hits.append(d)
-    if not hits:
-        return
-    lines = ["【基金溢价套利提醒】开放申购且溢价率>%.1f%% 的 LOF 共 %d 只："
-             % (threshold, len(hits))]
-    for d in hits:
-        amt = sub.get(d["code"], {}).get("amount", "")
-        lines.append("• %s(%s) 溢价率 %.2f%%，可申购%s"
-                     % (d["name"], d["code"], d["premium"],
-                        ("限额 " + amt if amt else "额度充足")))
-    lines.append("时间：%s" % beijing_now().strftime("%Y-%m-%d %H:%M:%S"))
-    text = "\n".join(lines)
-    for t in cfg["targets"]:
-        ok = send_webhook(t.get("platform", "dingtalk"), t.get("webhook", ""), text)
-        print("[提醒] 用户 %s 推送到 %s，结果=%s" % (key, t.get("platform"), ok))
+        lines = ["【基金溢价套利提醒】开放申购且溢价率>%.1f%% 的 LOF 共 %d 只："
+                 % (threshold, len(hits))]
+        for d in hits:
+            amt = sub.get(d["code"], {}).get("amount", "")
+            lines.append("• %s(%s) 溢价率 %.2f%%，可申购%s"
+                         % (d["name"], d["code"], d["premium"],
+                            ("限额 " + amt if amt else "额度充足")))
+        lines.append("时间：%s" % beijing_now().strftime("%Y-%m-%d %H:%M:%S"))
+        text = "\n".join(lines)
+        for t in m["targets"]:
+            ok = send_webhook(t.get("platform", "dingtalk"), t.get("webhook", ""), text)
+            print("[提醒] 链接 %s 成员 %s 推送到 %s，结果=%s" % (key, owner, t.get("platform"), ok))
 
 
 def check_and_alert(key=None):
@@ -654,21 +679,35 @@ def api_subscribe():
 
 @app.route("/api/alert_config", methods=["GET"])
 def api_alert_config_get():
-    """返回指定用户的提醒配置（u 参数为用户 key）。"""
+    """返回指定链接下「当前成员(owner)」自己的配置；members_count 为该链接已配置人数。"""
     key = request.args.get("u") or ""
-    return jsonify({"ok": True, "config": get_user_alert(key)})
+    owner = request.args.get("owner") or ""
+    cfg = get_user_alert(key)
+    m = cfg["members"].get(owner, {"enabled": False, "threshold": 8.0, "targets": []})
+    return jsonify({
+        "ok": True,
+        "config": {
+            "enabled": m.get("enabled", False),
+            "threshold": m.get("threshold", 8.0),
+            "targets": m.get("targets", []),
+            "members_count": len(cfg["members"]),
+        },
+    })
 
 
 @app.route("/api/alert_config", methods=["POST"])
 def api_alert_config_post():
-    """保存指定用户的提醒配置（u 参数为用户 key），并立即检测一次。"""
+    """保存指定链接下「当前成员(owner)」自己的配置，只更新该成员，不影响其他成员（合并而非覆盖）。"""
     key = request.args.get("u") or ""
+    owner = request.args.get("owner") or "owner0"
     try:
         body = request.get_json(force=True, silent=True) or {}
         cfg = get_user_alert(key)
-        cfg["enabled"] = bool(body.get("enabled", cfg.get("enabled", False)))
+        members = cfg.setdefault("members", {})
+        m = members.get(owner, {"enabled": False, "threshold": 8.0, "targets": []})
+        m["enabled"] = bool(body.get("enabled", m.get("enabled", False)))
         try:
-            cfg["threshold"] = float(body.get("threshold", cfg.get("threshold", 8)))
+            m["threshold"] = float(body.get("threshold", m.get("threshold", 8)))
         except (TypeError, ValueError):
             pass
         # 多目标：从前端 targets 列表收集（过滤掉 webhook 为空的行）
@@ -679,11 +718,20 @@ def api_alert_config_post():
                     "platform": t.get("platform", "dingtalk"),
                     "webhook": str(t["webhook"]).strip(),
                 })
-        cfg["targets"] = targets
+        m["targets"] = targets
+        members[owner] = m
         set_user_alert(key, cfg)
         # 保存后立即检测一次（便于验证 Webhook 是否可用）
         threading.Thread(target=check_and_alert, args=(key,), daemon=True).start()
-        return jsonify({"ok": True, "config": cfg})
+        return jsonify({
+            "ok": True,
+            "config": {
+                "enabled": m["enabled"],
+                "threshold": m["threshold"],
+                "targets": m["targets"],
+                "members_count": len(members),
+            },
+        })
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)})
 
