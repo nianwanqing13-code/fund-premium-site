@@ -595,6 +595,15 @@ _ALERT_CONFIGS = load_alert_configs()
 _ALERT_CONFIGS_LOCK = threading.Lock()
 
 
+def _persist_one(key, cfg):
+    """把单个链接配置落盘（不持锁，调用方负责加锁）。优先写 DB，失败回退 JSON 文件。"""
+    if _DATABASE_URL:
+        if not _db_save_one(key, cfg):
+            save_alert_configs(_ALERT_CONFIGS)   # DB 不可用则写本地文件兜底
+    else:
+        save_alert_configs(_ALERT_CONFIGS)
+
+
 def get_user_alert(key):
     """返回某链接的提醒配置；不存在时创建默认配置并落盘。匿名(key 为空)返回默认不落盘。"""
     if not key:
@@ -604,7 +613,7 @@ def get_user_alert(key):
         if cfg is None:
             cfg = _default_alert_config()
             _ALERT_CONFIGS[key] = cfg
-            set_user_alert(key, cfg)
+            _persist_one(key, cfg)   # 直接落盘，避免重复加锁导致死锁
         return cfg
 
 
@@ -614,11 +623,7 @@ def set_user_alert(key, cfg):
         return
     with _ALERT_CONFIGS_LOCK:
         _ALERT_CONFIGS[key] = cfg
-        if _DATABASE_URL:
-            if not _db_save_one(key, cfg):
-                save_alert_configs(_ALERT_CONFIGS)   # DB 不可用则写本地文件兜底
-        else:
-            save_alert_configs(_ALERT_CONFIGS)
+        _persist_one(key, cfg)
 
 
 def send_webhook(platform, url, text):
