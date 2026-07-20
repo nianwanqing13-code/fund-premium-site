@@ -227,6 +227,39 @@ def _to_float(value):
 
 
 # ---------------------------------------------------------------------------
+# 基金速查网(dayfund)盘中实时估值：补齐 LOF 没有交易所 IOPV 的空白
+# 接口：/ajs/ajaxdata.shtml?showtype=getfundvalue&fundcode=CODE
+# 返回以 | 分隔的字段串，关键索引：
+#   [1] 最新单位净值(昨日公布)  [7] 盘中实时估值(即预估净值)  [5] 实时估值涨跌幅%
+# 注意：该站对单 IP 有频率限制，调用方需控制并发与超时。
+# ---------------------------------------------------------------------------
+_DAYFUND_BASE = "https://mfund.dayfund.com.cn"
+_DAYFUND_SESSION = requests.Session()
+_DAYFUND_SESSION.headers.update({
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+    "Referer": "https://mfund.dayfund.com.cn/",
+})
+
+
+def fetch_dayfund_estimate(code, timeout=6):
+    """返回 (est_val, nav_val) 或 (None, None)。est_val=盘中实时估值(预估净值)。"""
+    try:
+        url = f"{_DAYFUND_BASE}/ajs/ajaxdata.shtml?showtype=getfundvalue&fundcode={code}"
+        r = _DAYFUND_SESSION.get(url, timeout=timeout)
+        if r.status_code != 200:
+            return (None, None)
+        parts = r.text.strip().split("|")
+        if len(parts) < 8:
+            return (None, None)
+        est = _to_float(parts[7])   # 盘中实时估值
+        nav = _to_float(parts[1])   # 最新单位净值
+        return (est, nav)
+    except Exception:
+        return (None, None)
+
+
+
+# ---------------------------------------------------------------------------
 # LOF 行情：自行抓取东方财富接口
 # 说明：
 #   - akshare 的 fund_lof_spot_em() 当前会触发东方财富连接重置(RemoteDisconnected)，
@@ -339,32 +372,67 @@ def _fetch_one(fund_type, fetch_func):
         if df is None or df.empty:
             return records
 
+        if fund_type == "LOF":
+            # LOF 没有交易所实时 IOPV，改用基金速查网(dayfund)的盘中实时估值。
+            # 先收集所有 LOF 代码与市价，再用线程池并发查询 dayfund（控制并发与超时），
+            # 避免上千只逐只串行请求过慢。
+            codes, prices, names, chg = [], [], [], []
+            for _, row in df.iterrows():
+                code = str(row.get("代码", "")).strip()
+                price = _to_float(row.get("最新价"))
+                if not code or price is None:
+                    continue
+                codes.append(code)
+                prices.append(price)
+                names.append(str(row.get("名称", "")).strip())
+                chg.append(_to_float(row.get("涨跌幅")))
+
+            # 并发查询 dayfund 估值：code -> est_val
+            est_map = {}
+            with ThreadPoolExecutor(max_workers=16) as ex:
+                fut = {ex.submit(fetch_dayfund_estimate, c): c for c in codes}
+                for f in fut:
+                    c = fut[f]
+                    try:
+                        est, _nav = f.result()
+                        if est:
+                            est_map[c] = est
+                    except Exception:
+                        pass
+
+            for code, price, name, c in zip(codes, prices, names, chg):
+                est = est_map.get(code)
+                if est is None or est <= 0:
+                    continue
+                iopv_val = est
+                premium = (price - iopv_val) / iopv_val * 100.0
+                records.append(
+                    {
+                        "code": code,
+                        "name": name,
+                        "type": fund_type,
+                        "price": round(price, 4),
+                        "iopv": round(iopv_val, 4),
+                        "premium": round(premium, 3),
+                        "change_pct": c,
+                    }
+                )
+            return records
+
+        # ETF：使用交易所实时 IOPV(f441)
         for _, row in df.iterrows():
             price = _to_float(row.get("最新价"))
-
-            if fund_type == "LOF":
-                # LOF 没有实时 IOPV，用「折价率」反推：折价率=(净值-市价)/净值，负数为溢价
-                disc = _to_float(row.get("折价率"))
-                if price is None or disc is None:
-                    continue
-                premium = -disc
-                # LOF 无实时 IOPV，用溢价率反推估算净值，让「预估净值」列也有值
-                denom = 1.0 - disc / 100.0
-                iopv_val = price / denom if denom != 0 else None
-            else:
-                iopv = _to_float(row.get("IOPV实时估值"))
-                if price is None or iopv is None or iopv <= 0:
-                    continue
-                premium = (price - iopv) / iopv * 100.0
-                iopv_val = iopv
-
+            iopv = _to_float(row.get("IOPV实时估值"))
+            if price is None or iopv is None or iopv <= 0:
+                continue
+            premium = (price - iopv) / iopv * 100.0
             records.append(
                 {
                     "code": str(row.get("代码", "")).strip(),
                     "name": str(row.get("名称", "")).strip(),
                     "type": fund_type,
                     "price": round(price, 4),          # 当日市价
-                    "iopv": round(iopv_val, 4) if iopv_val is not None else None,  # 预估净值(ETF 实时 IOPV / LOF 用溢价率反推)
+                    "iopv": round(iopv, 4),            # 预估净值(ETF 实时 IOPV)
                     "premium": round(premium, 3),      # 溢价率(%)
                     "change_pct": _to_float(row.get("涨跌幅")),  # 当日涨跌幅(%)
                 }
@@ -374,6 +442,7 @@ def _fetch_one(fund_type, fetch_func):
         print(f"[警告] 获取 {fund_type} 数据失败：")
         traceback.print_exc()
     return records
+
 
 
 def _fetch_all_records():
