@@ -54,9 +54,20 @@ _CACHE_SECONDS = 60
 _fetch_lock = threading.Lock()   # 防止并发请求各自触发一次完整抓取
 
 
+# 北京时间（UTC+8）。Render 等云平台容器默认时区为 UTC，
+# 直接用 datetime.now()/time.strftime() 会拿到 UTC 时间，比北京时间晚 8 小时，
+# 导致页面“更新时间”显示错误、交易时段判断也错位。故统一用显式北京时间。
+_BEIJING_TZ = datetime.timezone(datetime.timedelta(hours=8))
+
+
+def beijing_now():
+    """返回当前北京时间（带时区），用于页面时间显示与交易时段判断。"""
+    return datetime.datetime.now(_BEIJING_TZ)
+
+
 def is_trade_time():
     """判断当前是否处于基金场内交易 / 申购时段（周一~周五 9:30-11:30、13:00-15:00）。"""
-    now = datetime.datetime.now()
+    now = beijing_now()
     if now.weekday() >= 5:          # 5=周六, 6=周日
         return False
     t = now.time()
@@ -480,7 +491,7 @@ def check_and_alert():
         lines.append("• %s(%s) 溢价率 %.2f%%，可申购%s"
                      % (d["name"], d["code"], d["premium"],
                         ("限额 " + amt if amt else "额度充足")))
-    lines.append("时间：%s" % time.strftime("%Y-%m-%d %H:%M:%S"))
+    lines.append("时间：%s" % beijing_now().strftime("%Y-%m-%d %H:%M:%S"))
     text = "\n".join(lines)
     ok = send_webhook(cfg.get("platform", "dingtalk"), cfg.get("webhook", ""), text)
     print("[提醒] 已推送 %d 只基金，结果=%s" % (len(hits), ok))
@@ -510,7 +521,7 @@ def api_premium():
             {
                 "ok": True,
                 "count": len(data),
-                "update_time": time.strftime("%Y-%m-%d %H:%M:%S"),
+                "update_time": beijing_now().strftime("%Y-%m-%d %H:%M:%S"),
                 "subscribe_info": {
                     "can_subscribe_now": is_trade_time(),
                     "period": "交易日 9:30-11:30、13:00-15:00（法定节假日除外）",
