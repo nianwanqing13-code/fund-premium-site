@@ -420,11 +420,99 @@ def get_fund_premium():
 
 # ---------------------------------------------------------------------------
 # 溢价套利提醒：当「开放申购」的 LOF 溢价率超过阈值时，推送到 微信/钉钉/飞书。
-# 配置保存在 alert_config.json（也可通过网页「提醒设置」弹窗修改）。
+# 配置持久化：优先用 Postgres（环境变量 DATABASE_URL），未配置时回退到本地 JSON 文件。
 # ---------------------------------------------------------------------------
 ALERT_CONFIGS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "alert_configs.json")
 _ALERT_COOLDOWN = 30 * 60  # 同一只基金两次推送的最小间隔（秒），避免刷屏
 _last_alert = {}            # {用户key: {基金代码: 上次推送时间戳}}，按用户独立冷却
+
+# ---- Postgres 持久化（Render 免费版磁盘不持久，配置会随重启丢失；用 DB 解决）----
+_DATABASE_URL = os.environ.get("DATABASE_URL")   # Render 注入的数据库连接串
+
+
+def _db_conn():
+    """打开一个数据库连接；未配置 DATABASE_URL 或连接失败则返回 None（回退 JSON）。"""
+    if not _DATABASE_URL:
+        return None
+    try:
+        import psycopg2
+        return psycopg2.connect(_DATABASE_URL, connect_timeout=5)
+    except Exception:
+        traceback.print_exc()
+        return None
+
+
+def _init_db():
+    """建表（首次部署时）。失败不影响启动，仅该次持久化不可用。"""
+    conn = _db_conn()
+    if conn is None:
+        return
+    try:
+        cur = conn.cursor()
+        cur.execute("CREATE TABLE IF NOT EXISTS alert_configs "
+                    "(key TEXT PRIMARY KEY, data TEXT)")
+        conn.commit()
+    except Exception:
+        traceback.print_exc()
+    finally:
+        cur.close()
+        conn.close()
+
+
+def _db_load_all():
+    """从 DB 读全部配置；失败返回 None（调用方回退 JSON）。"""
+    conn = _db_conn()
+    if conn is None:
+        return None
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT key, data FROM alert_configs")
+        rows = cur.fetchall()
+        return {r[0]: json.loads(r[1]) for r in rows}
+    except Exception:
+        traceback.print_exc()
+        return None
+    finally:
+        cur.close()
+        conn.close()
+
+
+def _db_save_one(key, cfg):
+    """把单个链接的配置 upsert 进 DB；返回是否成功。"""
+    conn = _db_conn()
+    if conn is None:
+        return False
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "INSERT INTO alert_configs(key, data) VALUES(%s,%s) "
+            "ON CONFLICT (key) DO UPDATE SET data = EXCLUDED.data",
+            (key, json.dumps(cfg, ensure_ascii=False)),
+        )
+        conn.commit()
+        return True
+    except Exception:
+        traceback.print_exc()
+        return False
+    finally:
+        cur.close()
+        conn.close()
+
+
+def _db_delete_one(key):
+    """从 DB 删除单个链接的配置。"""
+    conn = _db_conn()
+    if conn is None:
+        return
+    try:
+        cur = conn.cursor()
+        cur.execute("DELETE FROM alert_configs WHERE key=%s", (key,))
+        conn.commit()
+    except Exception:
+        traceback.print_exc()
+    finally:
+        cur.close()
+        conn.close()
 
 
 def _default_alert_config():
@@ -476,13 +564,17 @@ def _migrate_cfg(v):
 
 
 def load_alert_configs():
-    """加载全部用户的提醒配置：{user_key: {enabled, threshold, targets:[...]}}。"""
+    """加载全部用户的提醒配置。优先读 Postgres；无 DB 或读失败时回退本地 JSON 文件。"""
+    if _DATABASE_URL:
+        db_cfgs = _db_load_all()
+        if db_cfgs is not None:           # DB 可用：归一化后返回
+            return {k: _migrate_cfg(v) for k, v in db_cfgs.items()}
+    # 回退：本地 JSON 文件
     try:
         if os.path.exists(ALERT_CONFIGS_PATH):
             with open(ALERT_CONFIGS_PATH, "r", encoding="utf-8") as f:
                 cfgs = json.load(f)
             if isinstance(cfgs, dict):
-                # 归一化（兼容旧版单平台配置 + 补齐缺失字段）
                 return {k: _migrate_cfg(val) for k, val in cfgs.items()}
     except Exception:
         traceback.print_exc()
@@ -490,6 +582,7 @@ def load_alert_configs():
 
 
 def save_alert_configs(cfgs):
+    """兜底：把全部配置写入本地 JSON 文件（仅在没有 DB 时使用）。"""
     try:
         with open(ALERT_CONFIGS_PATH, "w", encoding="utf-8") as f:
             json.dump(cfgs, f, ensure_ascii=False, indent=2)
@@ -497,12 +590,13 @@ def save_alert_configs(cfgs):
         traceback.print_exc()
 
 
+_init_db()   # 首次部署自动建表
 _ALERT_CONFIGS = load_alert_configs()
 _ALERT_CONFIGS_LOCK = threading.Lock()
 
 
 def get_user_alert(key):
-    """返回某用户的提醒配置；用户不存在时创建默认配置并落盘。匿名(key 为空)返回默认不落盘。"""
+    """返回某链接的提醒配置；不存在时创建默认配置并落盘。匿名(key 为空)返回默认不落盘。"""
     if not key:
         return _default_alert_config()
     with _ALERT_CONFIGS_LOCK:
@@ -510,17 +604,21 @@ def get_user_alert(key):
         if cfg is None:
             cfg = _default_alert_config()
             _ALERT_CONFIGS[key] = cfg
-            save_alert_configs(_ALERT_CONFIGS)
+            set_user_alert(key, cfg)
         return cfg
 
 
 def set_user_alert(key, cfg):
-    """保存某用户的提醒配置（匿名 key 不保存）。"""
+    """保存某链接的提醒配置（匿名 key 不保存）。优先写 DB，失败回退 JSON 文件。"""
     if not key:
         return
     with _ALERT_CONFIGS_LOCK:
         _ALERT_CONFIGS[key] = cfg
-        save_alert_configs(_ALERT_CONFIGS)
+        if _DATABASE_URL:
+            if not _db_save_one(key, cfg):
+                save_alert_configs(_ALERT_CONFIGS)   # DB 不可用则写本地文件兜底
+        else:
+            save_alert_configs(_ALERT_CONFIGS)
 
 
 def send_webhook(platform, url, text):

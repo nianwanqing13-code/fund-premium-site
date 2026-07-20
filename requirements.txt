@@ -2,3 +2,4 @@ flask
 akshare
 pandas
 requests
+psycopg2-binary

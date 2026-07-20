@@ -1,3 +1,9 @@
+databases:
+  - name: fund-premium-db
+    databaseName: fund_premium
+    user: fund_premium_user
+    plan: free
+
 services:
   - type: web
     name: fund-premium-site
@@ -9,3 +15,7 @@ services:
     envVars:
       - key: PYTHON_VERSION
         value: "3.11"
+      - key: DATABASE_URL
+        fromDatabase:
+          name: fund-premium-db
+          property: connectionString
