@@ -220,7 +220,7 @@
         <th data-key="code">代码</th>
         <th data-key="name">名称</th>
         <th data-key="price">当日市价</th>
-        <th data-key="iopv">预估净值</th>
+        <th data-key="iopv" title="ETF=交易所实时IOPV（盘中变化）；LOF 无盘中实时 IOPV（交易所不公布），取昨日单位净值（固定）">预估净值</th>
         <th data-key="nav">昨日净值</th>
         <th data-key="change_pct">涨跌幅%</th>
           <th data-key="premium">溢价率% <span class="arrow">▼</span></th>
@@ -269,7 +269,8 @@
       数据来源：AKShare（东方财富）｜ 数据每 60 秒缓存一次，点击“刷新数据”获取最新<br />
       申购状态与可申购数额（日累计申购限额）来自天天基金档案，仅 LOF 为场内现金申购故取真实状态；ETF 为实物申赎（需一篮子股票），以基金公司公告为准<br />
       到账时间为常规规则（LOF 场内申购 T+2 到账可卖，ETF 多为实物申赎约 T+1），具体以基金公司公告为准<br />
-      本页仅供学习与参考，不构成任何投资建议。基金交易需自行核实数据并注意费用与风险。
+      本页仅供学习与参考，不构成任何投资建议。基金交易需自行核实数据并注意费用与风险。<br />
+      注：LOF 无盘中实时 IOPV（交易所不公布），其「预估净值」取昨日单位净值（标“昨”，固定不变）；ETF 的「预估净值」为交易所实时 IOPV（盘中变化）。溢价率均已按各类型正确计算。
     </footer>
   </div>
 
@@ -431,7 +432,7 @@
           <td class="code" data-label="代码">${d.code}</td>
           <td data-label="名称">${d.name}${badge}</td>
           <td data-label="市价">${fmt(d.price, 3)}</td>
-          <td data-label="净值">${fmt(d.iopv, 3)}</td>
+          <td data-label="净值">${d.type === 'LOF' ? fmt(d.iopv, 3) + ' (昨)' : fmt(d.iopv, 3)}</td>
           <td data-label="昨日净值">${d.nav === null || d.nav === undefined ? "-" : fmt(d.nav, 3)}</td>
           <td data-label="涨跌幅" class="${cCls}">${d.change_pct === null ? "-" : csign + fmt(d.change_pct, 2)}</td>
           <td data-label="溢价率" class="${pCls}">${sign}${fmt(d.premium, 3)}</td>
