@@ -260,6 +260,67 @@ def fetch_dayfund_estimate(code, timeout=6):
 
 
 # ---------------------------------------------------------------------------
+# QDII 原油/油气 LOF 的「合成盘中估算净值」：
+#   这类基金净值 T+1/T+2 滞后，dayfund 等数据源均不提供盘中实时估算。
+#   改用其底层标的（美股，东方财富免登录接口 push2delay）的当日涨跌幅反推：
+#       合成预估净值 = 昨日单位净值 × (1 + 底层标的当日涨跌幅%)
+#   底层映射：
+#     162411 华宝油气            -> XOP（标普石油天然气上游股票指数 ETF，与其跟踪指数一致）
+#     161129 易方达原油/501018 南方原油 -> USO（美国原油 ETF，近似 WTI 原油）
+#   仅在「美股盘中」启用（北京时间 21:30~次日4:00 夏令时 / 22:30~次日5:00 冬令时），
+#   休市时底层涨跌幅是 T-1 收盘值，直接乘会重复计算（昨净已含 T-1 涨跌），故退回昨净。
+#   该合成值为近似（未含日内汇率波动），前端标注「(估·油价)」以区分。
+# ---------------------------------------------------------------------------
+_QDII_OIL_MAP = {
+    "162411": "XOP",   # 华宝油气
+    "161129": "USO",   # 易方达原油
+    "501018": "USO",   # 南方原油
+}
+_UNDERLYING_CACHE = {"data": None, "time": 0}
+_UNDERLYING_TTL = 60
+
+
+def is_us_trade_time():
+    """当前是否处于美股盘中交易时段（北京时间，已考虑夏令时）。"""
+    now = beijing_now()
+    if now.weekday() >= 5:          # 周末无盘
+        return False
+    dst = now.month in (3, 4, 5, 6, 7, 8, 9, 10, 11)  # 夏令时近似（3~11 月）
+    t = now.time()
+    if dst:
+        open_t, close_t = datetime.time(21, 30), datetime.time(4, 0)
+    else:
+        open_t, close_t = datetime.time(22, 30), datetime.time(5, 0)
+    return t >= open_t or t <= close_t   # 跨午夜
+
+
+def fetch_underlying_chg():
+    """返回 {'XOP': 涨跌幅%, 'USO': 涨跌幅%}（百分比，如 1.25 表示 +1.25%）。
+    失败字段为 None。带 60s 缓存，避免频繁请求被限频。"""
+    global _UNDERLYING_CACHE
+    now = time.time()
+    if _UNDERLYING_CACHE["data"] is not None and (now - _UNDERLYING_CACHE["time"] < _UNDERLYING_TTL):
+        return _UNDERLYING_CACHE["data"]
+    res = {"XOP": None, "USO": None}
+    uh = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+          "Referer": "https://quote.eastmoney.com/"}
+    for sym in ("XOP", "USO"):
+        try:
+            r = requests.get("https://push2delay.eastmoney.com/api/qt/stock/get",
+                             params={"secid": f"107.{sym}", "fields": "f170"},
+                             headers=uh, timeout=8)
+            d = (r.json().get("data") or {})
+            v = d.get("f170")
+            if v is not None:
+                res[sym] = _to_float(v) / 100.0   # f170 为百分比×100（已实测验证）
+        except Exception:
+            pass
+    _UNDERLYING_CACHE["data"] = res
+    _UNDERLYING_CACHE["time"] = now
+    return res
+
+
+# ---------------------------------------------------------------------------
 # LOF 行情：自行抓取东方财富接口
 # 说明：
 #   - akshare 的 fund_lof_spot_em() 当前会触发东方财富连接重置(RemoteDisconnected)，
@@ -415,8 +476,14 @@ def _fetch_one(fund_type, fetch_func):
             else:
                 print("[提示] dayfund 接口本次不可用（探测失败），LOF/净值回退到东方财富数据。")
 
+        # 合成估算所需的底层标的涨跌幅（仅当列表里存在 QDII 原油/油气 LOF 时拉取一次）
+        und = {}
+        if any(c in _QDII_OIL_MAP for c in codes):
+            und = fetch_underlying_chg()
+
         for code, price, name, chg, ei, disc in zip(codes, prices, names, chgs, em_iopv, discs):
             iopv_realtime = False  # 该预估净值是否为盘中实时值（False=昨日净值兜底）
+            iopv_synth = False     # 该预估净值是否为「油价合成估算」（仅 QDII 原油/油气 LOF 美股盘中）
             if fund_type == "LOF":
                 # LOF 没有交易所实时 IOPV：优先用 dayfund 盘中实时估值；
                 # dayfund 失败时用「折价率」反推昨日单位净值作为预估净值兜底，保证 LOF 不整批丢失。
@@ -424,6 +491,20 @@ def _fetch_one(fund_type, fetch_func):
                 # 此时 iopv_realtime 应为 False，前端标注「(昨)」而非「(估)」。
                 iopv_val = est_map.get(code)
                 nav_val = nav_map.get(code)
+                # QDII 原油/油气 LOF：美股盘中用底层标的（XOP/USO）当日涨跌幅合成预估净值
+                if code in _QDII_OIL_MAP:
+                    sym = _QDII_OIL_MAP[code]
+                    pct = und.get(sym)
+                    base_nav = nav_val
+                    if base_nav is None and disc is not None:
+                        denom = 1.0 - disc / 100.0
+                        if denom != 0:
+                            base_nav = price / denom
+                    if base_nav and base_nav > 0 and is_us_trade_time() and pct is not None:
+                        iopv_val = base_nav * (1.0 + pct / 100.0)
+                        nav_val = base_nav
+                        iopv_realtime = True  # 合成盘中估算（基于油价，会随美股跳动）
+                        iopv_synth = True
                 if iopv_val and iopv_val > 0 and nav_val and nav_val > 0 \
                         and abs(iopv_val - nav_val) > 1e-4:
                     iopv_realtime = True  # dayfund 给的是与昨净不同的真实盘中估算
@@ -461,6 +542,7 @@ def _fetch_one(fund_type, fetch_func):
                     "iopv": round(iopv_val, 4),        # 预估净值(ETF 实时 IOPV / LOF dayfund 或折价率反推)
                     "nav": round(nav_val, 4) if nav_val is not None else None,  # 昨日单位净值
                     "iopv_realtime": iopv_realtime,    # True=盘中实时估算；False=昨日净值(无实时估算)
+                    "iopv_synth": iopv_synth,          # True=油价合成估算（QDII 原油/油气 LOF 美股盘中）
                     "premium": round(premium, 3),      # 溢价率(%)
                     "change_pct": chg,                 # 当日涨跌幅(%)
                 }
