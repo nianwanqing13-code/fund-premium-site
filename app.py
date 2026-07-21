@@ -416,10 +416,17 @@ def _fetch_one(fund_type, fetch_func):
                 print("[提示] dayfund 接口本次不可用（探测失败），LOF/净值回退到东方财富数据。")
 
         for code, price, name, chg, ei, disc in zip(codes, prices, names, chgs, em_iopv, discs):
+            iopv_realtime = False  # 该预估净值是否为盘中实时值（False=昨日净值兜底）
             if fund_type == "LOF":
                 # LOF 没有交易所实时 IOPV：优先用 dayfund 盘中实时估值；
                 # dayfund 失败时用「折价率」反推昨日单位净值作为预估净值兜底，保证 LOF 不整批丢失。
+                # 注意：QDII-LOF（原油/油气等）dayfund 返回的估值==昨日净值（无盘中估算），
+                # 此时 iopv_realtime 应为 False，前端标注「(昨)」而非「(估)」。
                 iopv_val = est_map.get(code)
+                nav_val = nav_map.get(code)
+                if iopv_val and iopv_val > 0 and nav_val and nav_val > 0 \
+                        and abs(iopv_val - nav_val) > 1e-4:
+                    iopv_realtime = True  # dayfund 给的是与昨净不同的真实盘中估算
                 if not (iopv_val and iopv_val > 0) and disc is not None:
                     denom = 1.0 - disc / 100.0
                     if denom != 0:
@@ -427,14 +434,14 @@ def _fetch_one(fund_type, fetch_func):
                 if iopv_val is None or iopv_val <= 0:
                     continue
                 # 昨日净值：dayfund 优先；否则同样用折价率反推（折价率本就基于昨日净值）
-                nav_val = nav_map.get(code)
                 if nav_val is None and disc is not None:
                     denom = 1.0 - disc / 100.0
                     if denom != 0:
                         nav_val = price / denom
             else:
-                # ETF 使用交易所实时 IOPV(f441)
+                # ETF 使用交易所实时 IOPV(f441)，为盘中实时值
                 iopv_val = ei
+                iopv_realtime = True
                 if iopv_val is None or iopv_val <= 0:
                     continue
                 # 昨日净值：dayfund 优先；失败时用「昨收价」近似（ETF 市价紧贴净值，近似足够）
@@ -453,6 +460,7 @@ def _fetch_one(fund_type, fetch_func):
                     "price": round(price, 4),          # 当日市价
                     "iopv": round(iopv_val, 4),        # 预估净值(ETF 实时 IOPV / LOF dayfund 或折价率反推)
                     "nav": round(nav_val, 4) if nav_val is not None else None,  # 昨日单位净值
+                    "iopv_realtime": iopv_realtime,    # True=盘中实时估算；False=昨日净值(无实时估算)
                     "premium": round(premium, 3),      # 溢价率(%)
                     "change_pct": chg,                 # 当日涨跌幅(%)
                 }
